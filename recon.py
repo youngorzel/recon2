@@ -1,45 +1,34 @@
 r"""
-recon.py - LAN reconnaissance (fixed + stealth)
+recon.py - full LAN reconnaissance suite
 
-Stealth improvements:
-  - randomized SYN options per probe (Windows/Linux/macOS fingerprints)
-  - realistic User-Agent + Accept-Language per HTTP request
-  - ARP sweep with 20-80ms jitter per individual ARP
-  - mDNS queries spaced 300-700ms
-  - reverse DNS throttled (max 4 in flight, jitter)
-  - port scan: 1 thread (normal) / 2 (aggressive), shuffled ports
-  - random 0.5-2s pause before each new phase (looks human)
-  - grab_banner holds connection briefly even on no data (normal TCP)
-  - AXFR over TCP with proper length-prefixed read
-  - mDNS sniff starts BEFORE queries
-  - TCP options decode handles None
+Modes: stealth (passive), normal (moderate), aggressive (full)
 
-Bugfixes:
-  - AXFR TCP read loop no longer truncates mid-frame
-  - mDNS deep enum catches early responses
-  - passive OS fingerprint: SYN vs SYN-ACK separate matching
-  - nmap_os TTL reads from ICMP too
-  - reverse_dns_batch throttled
-  - DHCP servers_all now reported even when rogue_dhcp False
-
-Modes:
-  stealth     pure passive + external lookups (crt.sh, BGP)
-  normal      active with delays, low signature
-  aggressive  full active (AXFR, active OS, HTTP enum)
+New in this version (10 modules added):
+  1.  --diff OLD.json      compare with previous run
+  2.  --csv                export hosts table to CSV (Excel-ready)
+  3.  TLS weakness check   protocols, ciphers, cert issues
+  4.  HTTP security audit  HSTS, CSP, X-Frame-Options, etc.
+  5.  SNMP sysUpTime human parse + staleness warning
+  6.  LLDP VLAN extraction  (802.1 org-specific TLV 127)
+  7.  mDNS SRV + TXT       device model/location from Bonjour
+  8.  NTP enumeration      stratum, ref, drift, clock skew
+  9.  Kerberos realm + LDAP anonymous bind (AD recon)
+ 10.  Reverse DNS wildcard detection
 
 Usage:
-  python recon.py --mode stealth --sniff 300 --json
+  python recon.py --mode stealth --sniff 300 --json --csv
   python recon.py --mode normal --delay 2000 --json
-  python recon.py --mode aggressive --json
+  python recon.py --mode aggressive --json --csv
+  python recon.py --diff logs/recon_YYYYMMDD_HHMMSS.json
 
 Requires:
   pip install psutil scapy pysnmp requests
-  Npcap (WinPcap API-compatible mode)
-  Admin
+  Npcap (WinPcap API-compatible), Admin
 """
 
 import argparse
 import concurrent.futures
+import csv
 import ipaddress
 import json
 import os
@@ -71,7 +60,7 @@ try:
     from scapy.all import (
         ARP, Ether, IP, IPv6, ICMP, UDP, TCP, DNS, DNSQR, DNSRR,
         DHCP, BOOTP, conf, get_if_list, IFACES, Raw, sendp, srp, srp1, sr,
-        sniff as sc_sniff
+        sniff as sc_sniff, AsyncSniffer
     )
     HAVE_SCAPY = True
 except ImportError:
@@ -91,11 +80,42 @@ LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 CVE_CACHE_FILE = os.path.join(LOG_DIR, "cve_cache.json")
 IS_WIN = os.name == "nt"
 NO_WINDOW = 0x08000000 if IS_WIN else 0
-
 MODE_DELAY_MS = {"stealth": 0, "normal": 800, "aggressive": 0}
 
-# per-run caches
+_AGGRESSIVE_TIMING = [False]
+_PUBLIC_IP_OVERRIDE = [None]
+_CRT_DOMAIN_OVERRIDE = [None]
+
 _IPCFG = {"text": None, "parsed": None, "lock": threading.Lock()}
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+]
+ACCEPT_LANGS = ["en-US,en;q=0.9", "pl-PL,pl;q=0.9,en;q=0.8", "en-GB,en;q=0.9"]
+
+
+def _ua(): return random.choice(USER_AGENTS)
+def _accept_lang(): return random.choice(ACCEPT_LANGS)
+
+
+SYN_PROFILES = {
+    "windows": {"ttl": 128, "window": 64240,
+                "options": [("MSS", 1460), ("SAckOK", b""), ("WScale", 8)]},
+    "linux": {"ttl": 64, "window": 29200,
+              "options": [("MSS", 1460), ("SAckOK", b""),
+                          ("Timestamp", (random.randint(100000, 900000), 0)),
+                          ("NOP", None), ("WScale", 7)]},
+    "macos": {"ttl": 64, "window": 65535,
+              "options": [("MSS", 1460), ("NOP", None), ("WScale", 6),
+                          ("NOP", None), ("NOP", None), ("SAckOK", b""),
+                          ("Timestamp", (random.randint(100000, 900000), 0))]},
+}
+
+
+def _random_syn_profile():
+    return random.choice(list(SYN_PROFILES.values()))
 
 
 def _ipconfig_text():
@@ -110,57 +130,6 @@ def _ipconfig_parsed():
         if _IPCFG["parsed"] is None:
             _IPCFG["parsed"] = _parse_ipconfig(_ipconfig_text())
         return _IPCFG["parsed"]
-
-
-# ============================================================
-# realistic User-Agents + SYN fingerprints
-# ============================================================
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) "
-    "Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-]
-
-ACCEPT_LANGS = ["en-US,en;q=0.9", "pl-PL,pl;q=0.9,en;q=0.8",
-                "en-GB,en;q=0.9", "de-DE,de;q=0.9,en;q=0.8"]
-
-
-def _ua():
-    return random.choice(USER_AGENTS)
-
-
-def _accept_lang():
-    return random.choice(ACCEPT_LANGS)
-
-
-# Per-OS realistic SYN option sets (used when we craft SYN actively)
-SYN_PROFILES = {
-    "windows": {
-        "ttl": 128, "window": 64240,
-        "options": [("MSS", 1460), ("SAckOK", b""), ("WScale", 8)],
-    },
-    "linux": {
-        "ttl": 64, "window": 29200,
-        "options": [("MSS", 1460), ("SAckOK", b""), ("Timestamp", (random.randint(100000, 900000), 0)),
-                     ("NOP", None), ("WScale", 7)],
-    },
-    "macos": {
-        "ttl": 64, "window": 65535,
-        "options": [("MSS", 1460), ("NOP", None), ("WScale", 6),
-                     ("NOP", None), ("NOP", None), ("SAckOK", b""),
-                     ("Timestamp", (random.randint(100000, 900000), 0))],
-    },
-}
-
-
-def _random_syn_profile():
-    return random.choice(list(SYN_PROFILES.values()))
 
 
 # ============================================================
@@ -211,8 +180,10 @@ RESULTS = {
     "hosts": [],
     "ssdp": [], "mdns": [], "mdns_deep": [], "upnp_igd": {}, "dns_srv": [],
     "arp_spoof": [], "dhcp_servers_all": [], "rogue_dhcp": False,
-    "crt_sh": [], "bgp": {},
-    "snmp_traps": [], "dns_axfr": {},
+    "crt_sh": [], "bgp": {}, "snmp_traps": [], "dns_axfr": {},
+    "public_ip": None, "domain": None,
+    "kerberos_realm": None, "ldap_anon": {}, "ntp": {},
+    "dns_wildcard": None,
 }
 RESULTS_LOCK = threading.Lock()
 
@@ -254,54 +225,45 @@ def now_local_iso():
 
 
 def human_pause():
-    """Small random human-like pause."""
+    if _AGGRESSIVE_TIMING[0]: return
     time.sleep(random.uniform(0.5, 2.0))
 
 
 def sleep_delay(ms):
+    if _AGGRESSIVE_TIMING[0]: return
     if ms <= 0:
-        time.sleep(random.uniform(0.02, 0.15))
-        return
+        time.sleep(random.uniform(0.02, 0.15)); return
     base = ms / 1000.0
     jitter = random.uniform(-0.2, 0.5) * base
     time.sleep(max(0.05, base + jitter))
 
 
 def iter_ifaces():
-    if not HAVE_SCAPY:
-        return
+    if not HAVE_SCAPY: return
     try:
         vals = IFACES.values() if hasattr(IFACES, "values") else IFACES
-        for i in vals:
-            yield i
-    except Exception:
-        return
+        for i in vals: yield i
+    except Exception: return
 
 
 def iface_obj_field(obj, field):
-    try:
-        return getattr(obj, field, None)
-    except Exception:
-        return None
+    try: return getattr(obj, field, None)
+    except Exception: return None
 
 
 def find_iface_by_any_name(target):
-    if not HAVE_SCAPY or not target:
-        return None
+    if not HAVE_SCAPY or not target: return None
     tlow = target.lower()
     for i in iter_ifaces():
         name = iface_obj_field(i, "name") or ""
         net = iface_obj_field(i, "network_name") or ""
         rep = str(i)
-        if target in (name, net, rep):
-            return i
-        if tlow in (name.lower(), net.lower(), rep.lower()):
-            return i
+        if target in (name, net, rep): return i
+        if tlow in (name.lower(), net.lower(), rep.lower()): return i
     for i in iter_ifaces():
         name = (iface_obj_field(i, "name") or "").lower()
         net = (iface_obj_field(i, "network_name") or "").lower()
-        if tlow and (tlow in name or tlow in net):
-            return i
+        if tlow and (tlow in name or tlow in net): return i
     return None
 
 
@@ -313,10 +275,8 @@ def iface_ipv4_list(obj):
         if v4:
             if isinstance(v4, (list, tuple)):
                 out.extend(str(x) for x in v4)
-            else:
-                out.append(str(v4))
-    except Exception:
-        pass
+            else: out.append(str(v4))
+    except Exception: pass
     return out
 
 
@@ -347,15 +307,13 @@ OUI_DB = {
 
 
 def oui_lookup(mac):
-    if not mac:
-        return None
+    if not mac: return None
     norm = mac.upper().replace("-", ":")
-    prefix = ":".join(norm.split(":")[:3])
-    return OUI_DB.get(prefix)
+    return OUI_DB.get(":".join(norm.split(":")[:3]))
 
 
 # ============================================================
-# NVD CVE
+# NVD
 # ============================================================
 
 def _load_cve_cache():
@@ -363,8 +321,7 @@ def _load_cve_cache():
         if os.path.exists(CVE_CACHE_FILE):
             with open(CVE_CACHE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-    except Exception:
-        pass
+    except Exception: pass
     return {}
 
 
@@ -373,8 +330,7 @@ def _save_cve_cache(cache):
         os.makedirs(LOG_DIR, exist_ok=True)
         with open(CVE_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+    except Exception: pass
 
 
 _CVE_CACHE = _load_cve_cache()
@@ -384,8 +340,7 @@ _NVD_MIN = 6.5
 
 def _nvd_rate_limit():
     el = time.time() - _NVD_LAST[0]
-    if el < _NVD_MIN:
-        time.sleep(_NVD_MIN - el)
+    if el < _NVD_MIN: time.sleep(_NVD_MIN - el)
     _NVD_LAST[0] = time.time()
 
 
@@ -396,17 +351,14 @@ def _cve_matches_version(cve_entry, version):
                 for cm in node.get("cpeMatch", []):
                     if version.lower() in (cm.get("criteria") or "").lower():
                         return True
-    except Exception:
-        pass
+    except Exception: pass
     return False
 
 
 def nvd_lookup(product, version):
-    if not HAVE_REQUESTS or not product or not version:
-        return []
+    if not HAVE_REQUESTS or not product or not version: return []
     key = "{}|{}".format(product.lower(), version.lower())
-    if key in _CVE_CACHE:
-        return _CVE_CACHE[key]
+    if key in _CVE_CACHE: return _CVE_CACHE[key]
     _nvd_rate_limit()
     url = ("https://services.nvd.nist.gov/rest/json/cves/2.0"
            "?keywordSearch={}&resultsPerPage=100".format(
@@ -434,8 +386,7 @@ def nvd_lookup(product, version):
             results.append({"id": cve.get("id", ""),
                             "cvss": "{} {}".format(score, sev or "").strip(),
                             "score": score, "desc": desc[:200]})
-    except Exception:
-        pass
+    except Exception: pass
     results.sort(key=lambda x: x.get("score") or 0, reverse=True)
     _CVE_CACHE[key] = results; _save_cve_cache(_CVE_CACHE)
     return results
@@ -454,22 +405,17 @@ STATIC_FINGERPRINTS = [
 
 
 def detect_product_version(text):
-    if not text:
-        return []
+    if not text: return []
     out = []
     for fp in STATIC_FINGERPRINTS:
         m = re.search(fp["pattern"], text, re.I)
-        if m and m.groups():
-            out.append((fp["product"], m.group(1)))
+        if m and m.groups(): out.append((fp["product"], m.group(1)))
     m = CISCO_IOS_RE.search(text)
-    if m:
-        out.append(("cisco ios", m.group(1)))
+    if m: out.append(("cisco ios", m.group(1)))
     m = LINUX_KERNEL_RE.search(text)
-    if m:
-        out.append(("linux kernel", m.group(1)))
+    if m: out.append(("linux kernel", m.group(1)))
     m = re.search(r"Windows Server (\d{4}(?:\sR2)?)", text, re.I)
-    if m:
-        out.append(("windows server", m.group(1)))
+    if m: out.append(("windows server", m.group(1)))
     return out
 
 
@@ -478,22 +424,16 @@ def detect_product_version(text):
 # ============================================================
 
 def _detect_route():
-    if not HAVE_SCAPY:
-        return None, None
+    if not HAVE_SCAPY: return None, None
     avail = set(get_if_list())
     for t in ["8.8.8.8", "1.1.1.1"]:
-        try:
-            r = conf.route.route(t)
-        except Exception:
-            continue
-        if not r:
-            continue
+        try: r = conf.route.route(t)
+        except Exception: continue
+        if not r: continue
         iface = r[0] if len(r) >= 1 else None
         gw = r[2] if len(r) >= 3 else None
-        if not iface or iface in ("lo", "lo0", "\\Device\\NPF_Loopback"):
-            continue
-        if iface in avail:
-            return iface, "scapy route to {} via gw {}".format(t, gw)
+        if not iface or iface in ("lo", "lo0", "\\Device\\NPF_Loopback"): continue
+        if iface in avail: return iface, "scapy route to {} via gw {}".format(t, gw)
         obj = find_iface_by_any_name(iface)
         if obj:
             return (iface_obj_field(obj, "network_name") or iface,
@@ -502,19 +442,16 @@ def _detect_route():
 
 
 def _detect_ps():
-    if not IS_WIN:
-        return None, None
+    if not IS_WIN: return None, None
     ps = ("Get-NetRoute -DestinationPrefix '0.0.0.0/0' -EA SilentlyContinue | "
           "Where-Object { $_.NextHop -ne '0.0.0.0' } | Sort-Object RouteMetric | "
           "Select-Object -First 1 | ForEach-Object { $_.InterfaceIndex }")
     idx = run('powershell -NoProfile -Command "{}"'.format(ps)).strip()
-    if not idx or not idx.split()[0].isdigit():
-        return None, None
+    if not idx or not idx.split()[0].isdigit(): return None, None
     idx = idx.split()[0]
     ps2 = "Get-NetAdapter -InterfaceIndex {} -EA SilentlyContinue | Select-Object -First 1 -ExpandProperty Name"
     an = run('powershell -NoProfile -Command "{}"'.format(ps2.format(idx))).strip()
-    if not an:
-        return None, None
+    if not an: return None, None
     for i in iter_ifaces():
         desc = (iface_obj_field(i, "description") or "").lower()
         name = (iface_obj_field(i, "name") or "").lower()
@@ -527,48 +464,37 @@ def _detect_ps():
 def _parse_ipconfig(text):
     adapters = []; current = None
     for line in (text or "").splitlines():
-        if not line.strip():
-            continue
+        if not line.strip(): continue
         s = line.strip()
         if line[0] not in (" ", "\t") and s.endswith(":"):
-            if current is not None:
-                adapters.append(current)
+            if current is not None: adapters.append(current)
             current = {"name": s[:-1].strip(), "ipv4": [], "gateway": [],
                        "dns": [], "dhcp": None, "disconnected": False}
             continue
-        if current is None:
-            continue
+        if current is None: continue
         low = s.lower()
         if "media state" in low and "disconnected" in low:
-            current["disconnected"] = True
-            continue
+            current["disconnected"] = True; continue
         if "stan" in low and "roz" in low and "czony" in low:
-            current["disconnected"] = True
-            continue
+            current["disconnected"] = True; continue
         if "ipv4" in low and ("address" in low or "adres" in low):
             val = s.split(":", 1)[-1].strip().split("(")[0].strip()
-            if val and is_ipv4(val):
-                current["ipv4"].append(val)
+            if val and is_ipv4(val): current["ipv4"].append(val)
         elif "gateway" in low or "brama" in low:
             val = s.split(":", 1)[-1].strip()
-            if val and is_ipv4(val):
-                current["gateway"].append(val)
+            if val and is_ipv4(val): current["gateway"].append(val)
         elif "dhcp" in low:
             val = s.split(":", 1)[-1].strip()
-            if val and is_ipv4(val):
-                current["dhcp"] = val
+            if val and is_ipv4(val): current["dhcp"] = val
         elif "dns" in low:
             val = s.split(":", 1)[-1].strip()
-            if val and is_ipv4(val):
-                current["dns"].append(val)
-    if current is not None:
-        adapters.append(current)
+            if val and is_ipv4(val): current["dns"].append(val)
+    if current is not None: adapters.append(current)
     return adapters
 
 
 def _map_ip_npcap(ip):
-    if not HAVE_SCAPY:
-        return None
+    if not HAVE_SCAPY: return None
     for i in iter_ifaces():
         if ip in iface_ipv4_list(i):
             return iface_obj_field(i, "network_name") or iface_obj_field(i, "name")
@@ -578,107 +504,46 @@ def _map_ip_npcap(ip):
 def _detect_ipcfg():
     cands = [a for a in _ipconfig_parsed()
              if not a["disconnected"] and a["ipv4"] and a["gateway"]]
-    if not cands:
-        return None, None
+    if not cands: return None, None
     virtual = ("vethernet", "virtualbox", "vmware", "hyper-v", "wsl",
                "loopback", "tap-", "tun", "default switch")
     cands.sort(key=lambda a: (1 if any(h in a["name"].lower() for h in virtual) else 0,
                                -len(a["ipv4"]), a["name"].lower()))
     for ip in cands[0]["ipv4"]:
         m = _map_ip_npcap(ip)
-        if m:
-            return m, "ipconfig adapter '{}'".format(cands[0]["name"])
+        if m: return m, "ipconfig adapter '{}'".format(cands[0]["name"])
     return None, None
 
 
 def _detect_probe():
-    if not HAVE_SCAPY:
-        return None, None
+    if not HAVE_SCAPY: return None, None
     best, bestn = None, -1
     for iface in get_if_list():
-        if "Loopback" in iface:
-            continue
-        try:
-            n = len(sc_sniff(iface=iface, timeout=2, count=10, store=True))
-        except Exception:
-            n = -1
-        if n > bestn:
-            bestn, best = n, iface
-        if n >= 10:
-            break
-    if bestn > 0:
-        return best, "traffic probe ({} pkts)".format(bestn)
+        if "Loopback" in iface: continue
+        try: n = len(sc_sniff(iface=iface, timeout=1, count=10, store=True))
+        except Exception: continue
+        if n > bestn: bestn, best = n, iface
+        if n >= 10: break
+    if bestn > 0: return best, "traffic probe ({} pkts)".format(bestn)
     return None, None
 
 
 def pick_card(verbose=True):
-    if not HAVE_SCAPY:
-        return None, "scapy not installed"
+    if not HAVE_SCAPY: return None, "scapy not installed"
     steps = [("scapy route", _detect_route), ("powershell", _detect_ps),
              ("ipconfig", _detect_ipcfg), ("traffic probe", _detect_probe)]
-    if verbose:
-        print("detecting network card...")
+    if verbose: print("detecting network card...")
     for label, fn in steps:
-        if verbose:
-            print("  trying: {}".format(label))
-        try:
-            iface, reason = fn()
+        if verbose: print("  trying: {}".format(label))
+        try: iface, reason = fn()
         except Exception as e:
-            if verbose:
-                print("    error: {}".format(e))
+            if verbose: print("    error: {}".format(e))
             continue
         if iface:
-            if verbose:
-                print("    -> {}".format(iface))
+            if verbose: print("    -> {}".format(iface))
             return iface, reason
-        if verbose:
-            print("    no result")
+        if verbose: print("    no result")
     return None, "no method worked"
-
-
-def get_my_network(iface):
-    info = {"iface": iface, "ip": None, "netmask": None,
-            "subnet": None, "gateway": None, "dns": []}
-    if not HAVE_SCAPY:
-        return info
-    obj = find_iface_by_any_name(iface)
-    if obj:
-        ips = iface_ipv4_list(obj)
-        if ips:
-            info["ip"] = ips[0]
-    if info["ip"]:
-        try:
-            for pname, addrs in psutil.net_if_addrs().items():
-                for a in addrs:
-                    if a.family == socket.AF_INET and a.address == info["ip"]:
-                        info["netmask"] = a.netmask
-                        try:
-                            info["subnet"] = str(ipaddress.IPv4Network(
-                                "{}/{}".format(info["ip"], a.netmask), strict=False))
-                        except Exception:
-                            pass
-                        break
-                if info["netmask"]:
-                    break
-        except Exception:
-            pass
-    try:
-        r = conf.route.route("8.8.8.8")
-        if r and len(r) >= 3:
-            info["gateway"] = r[2]
-    except Exception:
-        pass
-    if not info["gateway"]:
-        for a in _ipconfig_parsed():
-            if a["gateway"]:
-                info["gateway"] = a["gateway"][0]; break
-    try:
-        for a in _ipconfig_parsed():
-            if info["ip"] and info["ip"] in a["ipv4"]:
-                info["dns"] = a["dns"]; break
-    except Exception:
-        pass
-    return info
 
 
 def get_iface_desc(iface):
@@ -689,10 +554,56 @@ def get_iface_desc(iface):
 
 
 def is_wireless(desc):
-    if not desc:
-        return False
+    if not desc: return False
     low = desc.lower()
     return any(h in low for h in ("wi-fi", "wifi", "wireless", "802.11", "wlan"))
+
+
+def get_my_network(iface):
+    info = {"iface": iface, "ip": None, "netmask": None, "subnet": None,
+            "gateway": None, "dns": []}
+    if not HAVE_SCAPY: return info
+    obj = find_iface_by_any_name(iface)
+    if obj:
+        ips = iface_ipv4_list(obj)
+        if ips: info["ip"] = ips[0]
+    if info["ip"]:
+        try:
+            for pname, addrs in psutil.net_if_addrs().items():
+                for a in addrs:
+                    if a.family == socket.AF_INET and a.address == info["ip"]:
+                        info["netmask"] = a.netmask; break
+                if info["netmask"]: break
+        except Exception: pass
+    if info["ip"] and not info["netmask"]:
+        try:
+            desc = get_iface_desc(iface).lower()
+            for pname, addrs in psutil.net_if_addrs().items():
+                if pname.lower() in desc or desc in pname.lower():
+                    for a in addrs:
+                        if a.family == socket.AF_INET:
+                            info["ip"] = info["ip"] or a.address
+                            info["netmask"] = a.netmask; break
+                    if info["netmask"]: break
+        except Exception: pass
+    if info["ip"] and info["netmask"]:
+        try:
+            info["subnet"] = str(ipaddress.IPv4Network(
+                "{}/{}".format(info["ip"], info["netmask"]), strict=False))
+        except Exception: pass
+    try:
+        r = conf.route.route("8.8.8.8")
+        if r and len(r) >= 3: info["gateway"] = r[2]
+    except Exception: pass
+    if not info["gateway"]:
+        for a in _ipconfig_parsed():
+            if a["gateway"]: info["gateway"] = a["gateway"][0]; break
+    try:
+        for a in _ipconfig_parsed():
+            if info["ip"] and info["ip"] in a["ipv4"]:
+                info["dns"] = a["dns"]; break
+    except Exception: pass
+    return info
 
 
 def link_info(ip):
@@ -709,13 +620,12 @@ def link_info(ip):
                        "duplex": "full" if s.duplex == 2 else (
                            "half" if s.duplex == 1 else "unknown")}
             break
-    except Exception:
-        pass
+    except Exception: pass
     return out if out else None
 
 
 # ============================================================
-# passive OS fingerprint (SYN vs SYN-ACK separated)
+# passive OS
 # ============================================================
 
 OS_DB_SYN = [
@@ -740,22 +650,16 @@ OS_DB_SYNACK = [
 
 
 def _decode_tcp_options(pkt):
-    """Safe: returns [] if pkt has no TCP or options are None."""
-    if not HAVE_SCAPY or not pkt.haslayer(TCP):
-        return []
+    if not HAVE_SCAPY or not pkt.haslayer(TCP): return []
     try:
         opts = pkt[TCP].options
-        if not opts:
-            return []
+        if not opts: return []
         names = []
         for opt in opts:
-            if isinstance(opt, tuple) and opt:
-                names.append(str(opt[0]))
-            elif isinstance(opt, str):
-                names.append(opt)
+            if isinstance(opt, tuple) and opt: names.append(str(opt[0]))
+            elif isinstance(opt, str): names.append(opt)
         return names
-    except Exception:
-        return []
+    except Exception: return []
 
 
 def _normalize_opts(raw):
@@ -772,76 +676,50 @@ def _normalize_opts(raw):
 
 
 def _match_os(ttl, window, norm, db):
-    best = None
-    best_score = 0
+    best = None; best_score = 0
     for d_ttl, d_win, d_opts, d_os in db:
         score = 0
-        if d_ttl == ttl:
-            score += 3
-        elif abs(d_ttl - ttl) <= 4:
-            score += 1
-        if d_win == window:
-            score += 3
-        elif abs(d_win - window) <= 200:
-            score += 2
-        elif abs(d_win - window) <= max(d_win * 0.05, 1000):
-            score += 1
+        if d_ttl == ttl: score += 3
+        elif abs(d_ttl - ttl) <= 4: score += 1
+        if d_win == window: score += 3
+        elif abs(d_win - window) <= 200: score += 2
+        elif abs(d_win - window) <= max(d_win * 0.05, 1000): score += 1
         score += sum(1 for a, b in zip(norm, d_opts) if a == b)
-        if score > best_score:
-            best_score = score
-            best = (d_os, ttl, window)
+        if score > best_score: best_score = score; best = (d_os, ttl, window)
     return best if best_score >= 4 else None
 
 
 def passive_os_fingerprint(pkt):
-    """Separate matching for client SYN vs server SYN-ACK."""
-    if not HAVE_SCAPY or not pkt.haslayer(IP) or not pkt.haslayer(TCP):
-        return None
+    if not HAVE_SCAPY or not pkt.haslayer(IP) or not pkt.haslayer(TCP): return None
     try:
         tcp = pkt[TCP]
         flags = int(tcp.flags)
-        is_syn = bool(flags & 0x02)
+        if not (flags & 0x02): return None
         is_ack = bool(flags & 0x10)
-        if not is_syn:
-            return None
-        ttl = int(pkt[IP].ttl)
-        window = int(tcp.window)
+        ttl = int(pkt[IP].ttl); window = int(tcp.window)
         norm = _normalize_opts(_decode_tcp_options(pkt))
-        db = OS_DB_SYNACK if is_ack else OS_DB_SYN
-        return _match_os(ttl, window, norm, db)
-    except Exception:
-        return None
+        return _match_os(ttl, window, norm, OS_DB_SYNACK if is_ack else OS_DB_SYN)
+    except Exception: return None
 
-
-# ============================================================
-# TCP uptime
-# ============================================================
 
 def tcp_uptime_from_packet(pkt):
-    if not HAVE_SCAPY or not pkt.haslayer(IP) or not pkt.haslayer(TCP):
-        return None
+    if not HAVE_SCAPY or not pkt.haslayer(IP) or not pkt.haslayer(TCP): return None
     try:
         opts = pkt[TCP].options
-        if not opts:
-            return None
+        if not opts: return None
         for opt in opts:
-            if isinstance(opt, tuple) and len(opt) >= 2 and \
-               str(opt[0]).lower() == "timestamp":
+            if isinstance(opt, tuple) and len(opt) >= 2 and str(opt[0]).lower() == "timestamp":
                 tsval = opt[1][0] if isinstance(opt[1], tuple) else opt[1]
-                if not isinstance(tsval, int):
-                    continue
+                if not isinstance(tsval, int): continue
                 uptime_s = tsval / 1000.0
-                if uptime_s < 120 or uptime_s > 60 * 60 * 24 * 365 * 10:
-                    return None
+                if uptime_s < 120 or uptime_s > 60 * 60 * 24 * 365 * 10: return None
                 return (int(uptime_s), pkt[IP].src)
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 
 def format_uptime(seconds):
-    if seconds is None:
-        return "?"
+    if seconds is None: return "?"
     d = seconds // 86400
     h = (seconds % 86400) // 3600
     m = (seconds % 3600) // 60
@@ -855,90 +733,83 @@ def format_uptime(seconds):
 # ============================================================
 
 def passive_listen(iface, seconds=90, watch_snmp_traps=False):
-    if not HAVE_SCAPY:
-        return None
+    if not HAVE_SCAPY: return None
     found = {
-        "arp": {}, "arp_spoof": [],
-        "dhcp_offers": [], "dhcp_servers_all": [], "rogue_dhcp": False,
-        "lldp": None, "cdp": None,
+        "arp": {}, "arp_spoof": [], "dhcp_offers": [], "dhcp_servers_all": [],
+        "rogue_dhcp": False, "lldp": None, "cdp": None,
         "mdns": [], "ssdp": [], "dns_queries": [], "dns_answers": [],
         "tls_sni": [], "http_host": [], "netbios": [], "llmnr": [],
         "tcp_os": {}, "tcp_uptime": {}, "snmp_traps": [],
     }
-    seen = {k: set() for k in
-            ["mdns", "ssdp", "sni", "http", "dns", "llmnr", "spoof", "nbios"]}
+    seen = {k: set() for k in ["mdns", "ssdp", "sni", "http", "dns", "llmnr",
+                               "spoof", "nbios", "traps"]}
     arp_ip_to_mac = {}
     dhcp_servers = set()
 
     def parse_lldp(raw):
         try:
-            if len(raw) < 2:
-                return
+            if len(raw) < 2: return
             info = {}; idx = 0
             while idx + 2 <= len(raw):
                 hdr = int.from_bytes(raw[idx:idx+2], "big")
                 t = (hdr >> 9) & 0x7F; l = hdr & 0x1FF; idx += 2
-                if idx + l > len(raw):
-                    break
+                if idx + l > len(raw): break
                 val = raw[idx:idx+l]; idx += l
-                if t == 0:
-                    break
-                if t == 1 and len(val) >= 1:
-                    info["chassis_id"] = _decode_id(val[1:])
-                elif t == 2 and len(val) >= 1:
-                    info["port_id"] = _decode_id(val[1:])
-                elif t == 4:
-                    info["port_desc"] = val.decode("utf-8", errors="ignore")
-                elif t == 5:
-                    info["system_name"] = val.decode("utf-8", errors="ignore")
-                elif t == 6:
-                    info["system_description"] = val.decode("utf-8", errors="ignore")
+                if t == 0: break
+                if t == 1 and len(val) >= 1: info["chassis_id"] = _decode_id(val[1:])
+                elif t == 2 and len(val) >= 1: info["port_id"] = _decode_id(val[1:])
+                elif t == 4: info["port_desc"] = val.decode("utf-8", errors="ignore")
+                elif t == 5: info["system_name"] = val.decode("utf-8", errors="ignore")
+                elif t == 6: info["system_description"] = val.decode("utf-8", errors="ignore")
                 elif t == 8 and len(val) >= 2:
                     if val[1] == 1 and val[0] >= 2:
                         info["management_ip"] = ".".join(str(b) for b in val[2:2+4])
-            if info:
-                found["lldp"] = info
-        except Exception:
-            pass
+                elif t == 127:
+                    # org-specific: check for 802.1 VLAN
+                    if len(val) >= 6 and val[0:3] == b"\x00\x80\xc2":
+                        subtype = val[3]
+                        if subtype == 1 and len(val) >= 6:  # Port VLAN ID
+                            info["vlan_pvid"] = int.from_bytes(val[4:6], "big")
+                        elif subtype == 2:  # Port And Protocol VLAN
+                            info["vlan_ppvid"] = val[4:].hex()
+                        elif subtype == 3:  # VLAN Name
+                            name_len = val[4]
+                            try:
+                                info["vlan_name"] = val[5:5+name_len].decode("utf-8", errors="ignore")
+                            except Exception:
+                                pass
+                        info["vlan_raw"] = val.hex()
+            if info: found["lldp"] = info
+        except Exception: pass
 
     def parse_cdp(data):
         try:
-            if len(data) < 4:
-                return
+            if len(data) < 4: return
             info = {}; idx = 4
             while idx + 4 <= len(data):
                 t = int.from_bytes(data[idx:idx+2], "big")
                 l = int.from_bytes(data[idx+2:idx+4], "big")
                 idx += 4
-                if l < 4 or idx + l - 4 > len(data):
-                    break
+                if l < 4 or idx + l - 4 > len(data): break
                 val = data[idx:idx+l-4]; idx += l - 4
-                if t == 1:
-                    info["device_id"] = val.decode("latin-1", errors="ignore")
-                elif t == 3:
-                    info["port_id"] = val.decode("latin-1", errors="ignore")
-                elif t == 5:
-                    info["version"] = val.decode("latin-1", errors="ignore")
-                elif t == 6:
-                    info["platform"] = val.decode("latin-1", errors="ignore")
-            if info:
-                found["cdp"] = info
-        except Exception:
-            pass
+                if t == 1: info["device_id"] = val.decode("latin-1", errors="ignore")
+                elif t == 3: info["port_id"] = val.decode("latin-1", errors="ignore")
+                elif t == 5: info["version"] = val.decode("latin-1", errors="ignore")
+                elif t == 6: info["platform"] = val.decode("latin-1", errors="ignore")
+                elif t == 14 and len(val) >= 2: info["native_vlan"] = int.from_bytes(val, "big")
+            if info: found["cdp"] = info
+        except Exception: pass
 
     def on_pkt(pkt):
         try:
             if pkt.haslayer(Ether):
                 et = pkt[Ether].type
-                if et == 0x88CC and pkt.haslayer(Raw):
-                    parse_lldp(bytes(pkt[Raw]))
+                if et == 0x88CC and pkt.haslayer(Raw): parse_lldp(bytes(pkt[Raw]))
                 elif et == 0x0000 and pkt.haslayer(Raw):
                     raw = bytes(pkt[Raw])
-                    if len(raw) >= 8 and raw[0:3] == b"\xaa\xaa\x03" \
-                            and raw[3:8] == b"\x00\x00\x0c\x20\x00":
+                    if len(raw) >= 8 and raw[0:3] == b"\xaa\xaa\x03" and raw[3:8] == b"\x00\x00\x0c\x20\x00":
                         parse_cdp(raw[8:])
-        except Exception:
-            pass
+        except Exception: pass
 
         try:
             if pkt.haslayer(ARP):
@@ -950,14 +821,11 @@ def passive_listen(iface, seconds=90, watch_snmp_traps=False):
                         key = (ip, prev, mac)
                         if key not in seen["spoof"]:
                             seen["spoof"].add(key)
-                            found["arp_spoof"].append({
-                                "ip": ip, "old_mac": prev, "new_mac": mac})
-                    arp_ip_to_mac[ip] = mac
-                    found["arp"][ip] = mac
+                            found["arp_spoof"].append({"ip": ip, "old_mac": prev, "new_mac": mac})
+                    arp_ip_to_mac[ip] = mac; found["arp"][ip] = mac
                 elif int(arp.op) == 1 and arp.psrc not in ("0.0.0.0", ""):
                     found["arp"][arp.psrc] = arp.hwsrc
-        except Exception:
-            pass
+        except Exception: pass
 
         try:
             if pkt.haslayer(DHCP) and pkt.haslayer(IP):
@@ -966,8 +834,7 @@ def passive_listen(iface, seconds=90, watch_snmp_traps=False):
                     if isinstance(opt, tuple) and opt[0] == "message-type":
                         msg_type = opt[1]; break
                 if msg_type == 2:
-                    sid = pkt[IP].src
-                    dhcp_servers.add(sid)
+                    sid = pkt[IP].src; dhcp_servers.add(sid)
                     entry = {"server_ip": sid,
                              "your_ip": pkt[BOOTP].yiaddr if pkt.haslayer(BOOTP) else None,
                              "options": {}}
@@ -978,15 +845,12 @@ def passive_listen(iface, seconds=90, watch_snmp_traps=False):
                         found["dhcp_offers"].append(entry)
                     found["dhcp_servers_all"] = sorted(dhcp_servers)
                     found["rogue_dhcp"] = len(dhcp_servers) > 1
-        except Exception:
-            pass
+        except Exception: pass
 
         try:
             if pkt.haslayer(UDP) and pkt.haslayer(DNS):
-                try:
-                    sp = int(pkt[UDP].sport); dp = int(pkt[UDP].dport)
-                except Exception:
-                    sp = dp = 0
+                try: sp = int(pkt[UDP].sport); dp = int(pkt[UDP].dport)
+                except Exception: sp = dp = 0
                 src = pkt[IP].src if pkt.haslayer(IP) else None
                 dns = pkt[DNS]
                 if dns.qr == 0 and dns.qd and 53 in (sp, dp):
@@ -1000,37 +864,29 @@ def passive_listen(iface, seconds=90, watch_snmp_traps=False):
                         g += 1
                         try:
                             name = rr.rrname
-                            if isinstance(name, bytes):
-                                name = name.decode(errors="ignore")
+                            if isinstance(name, bytes): name = name.decode(errors="ignore")
                             rdata = rr.rdata
-                            if isinstance(rdata, bytes):
-                                rdata = rdata.decode(errors="ignore")
+                            if isinstance(rdata, bytes): rdata = rdata.decode(errors="ignore")
                             key = (src, str(name))
                             if key not in seen["mdns"]:
                                 seen["mdns"].add(key)
-                                found["mdns"].append(
-                                    {"ip": src, "name": str(name).rstrip("."),
-                                     "data": str(rdata).rstrip(".")})
-                        except Exception:
-                            pass
+                                found["mdns"].append({"ip": src, "name": str(name).rstrip("."),
+                                                      "data": str(rdata).rstrip(".")})
+                        except Exception: pass
                         nxt = getattr(rr, "payload", None)
-                        if nxt is None or isinstance(nxt, DNS):
-                            break
+                        if nxt is None or isinstance(nxt, DNS): break
                         rr = nxt
                 if 5355 in (sp, dp) and dns.qr == 0 and dns.qd:
                     name = _qname(dns.qd)
                     if name and name not in seen["llmnr"]:
                         seen["llmnr"].add(name)
                         found["llmnr"].append({"host": name, "src": src})
-        except Exception:
-            pass
+        except Exception: pass
 
         try:
             if pkt.haslayer(UDP) and pkt.haslayer(Raw):
-                try:
-                    sp = int(pkt[UDP].sport); dp = int(pkt[UDP].dport)
-                except Exception:
-                    sp = dp = 0
+                try: sp = int(pkt[UDP].sport); dp = int(pkt[UDP].dport)
+                except Exception: sp = dp = 0
                 if 1900 in (sp, dp):
                     text = bytes(pkt[Raw]).decode("utf-8", errors="ignore")
                     if text.startswith(("NOTIFY", "HTTP/1.1")):
@@ -1038,10 +894,8 @@ def passive_listen(iface, seconds=90, watch_snmp_traps=False):
                         server = nt = None
                         for line in text.splitlines():
                             low = line.lower()
-                            if low.startswith("server:"):
-                                server = line.split(":", 1)[1].strip()
-                            elif low.startswith(("nt:", "st:")):
-                                nt = line.split(":", 1)[1].strip()
+                            if low.startswith("server:"): server = line.split(":", 1)[1].strip()
+                            elif low.startswith(("nt:", "st:")): nt = line.split(":", 1)[1].strip()
                         key = (src, server, nt)
                         if key not in seen["ssdp"]:
                             seen["ssdp"].add(key)
@@ -1054,9 +908,11 @@ def passive_listen(iface, seconds=90, watch_snmp_traps=False):
                 if watch_snmp_traps and 162 in (sp, dp):
                     src = pkt[IP].src if pkt.haslayer(IP) else None
                     payload = bytes(pkt[Raw])[:100].hex()
-                    found["snmp_traps"].append({"src": src, "hex": payload})
-        except Exception:
-            pass
+                    key = (src, payload)
+                    if key not in seen["traps"]:
+                        seen["traps"].add(key)
+                        found["snmp_traps"].append({"src": src, "hex": payload})
+        except Exception: pass
 
         try:
             if pkt.haslayer(TCP) and pkt.haslayer(Raw):
@@ -1078,138 +934,114 @@ def passive_listen(iface, seconds=90, watch_snmp_traps=False):
                                     dst = pkt[IP].dst if pkt.haslayer(IP) else None
                                     found["http_host"].append({"host": host, "dst": dst})
                                 break
-        except Exception:
-            pass
+        except Exception: pass
 
         try:
             os_hint = passive_os_fingerprint(pkt)
             if os_hint:
                 src = pkt[IP].src if pkt.haslayer(IP) else None
                 if src and src not in found["tcp_os"]:
-                    found["tcp_os"][src] = {
-                        "os": os_hint[0], "ttl": os_hint[1], "window": os_hint[2]}
+                    found["tcp_os"][src] = {"os": os_hint[0], "ttl": os_hint[1], "window": os_hint[2]}
             up = tcp_uptime_from_packet(pkt)
             if up and up[1] not in found["tcp_uptime"]:
                 found["tcp_uptime"][up[1]] = up[0]
-        except Exception:
-            pass
+        except Exception: pass
 
     print("passive listening {}s...".format(seconds), file=sys.stderr)
-    try:
-        sc_sniff(iface=iface, timeout=seconds, prn=on_pkt, store=False)
-    except Exception as e:
-        print("  sniff error: {}".format(e), file=sys.stderr)
+    try: sc_sniff(iface=iface, timeout=seconds, prn=on_pkt, store=False)
+    except Exception as e: print("  sniff error: {}".format(e), file=sys.stderr)
     return found
 
 
 def _qname(q):
-    if q is None:
-        return None
+    if q is None: return None
     try:
         n = q.qname
-        if isinstance(n, bytes):
-            n = n.decode(errors="ignore")
+        if isinstance(n, bytes): n = n.decode(errors="ignore")
         return str(n).rstrip(".")
-    except Exception:
-        return None
+    except Exception: return None
 
 
 def _decode_id(b):
     try:
         s = b.decode("ascii", errors="ignore").strip("\x00").strip()
-        if s and all(32 <= ord(c) < 127 for c in s):
-            return s
-    except Exception:
-        pass
-    if len(b) == 6:
-        return ":".join("{:02x}".format(x) for x in b)
+        if s and all(32 <= ord(c) < 127 for c in s): return s
+    except Exception: pass
+    if len(b) == 6: return ":".join("{:02x}".format(x) for x in b)
     return b.hex()
 
 
 def _parse_sni(payload):
     try:
         idx = 5
-        if idx >= len(payload) or payload[idx] != 0x01:
-            return None
+        if idx >= len(payload) or payload[idx] != 0x01: return None
         idx += 4 + 2 + 32
-        if idx >= len(payload):
-            return None
+        if idx >= len(payload): return None
         sid_len = payload[idx]; idx += 1 + sid_len
-        if idx + 2 > len(payload):
-            return None
+        if idx + 2 > len(payload): return None
         cs_len = int.from_bytes(payload[idx:idx+2], "big"); idx += 2 + cs_len
-        if idx >= len(payload):
-            return None
+        if idx >= len(payload): return None
         cm_len = payload[idx]; idx += 1 + cm_len
-        if idx + 2 > len(payload):
-            return None
+        if idx + 2 > len(payload): return None
         ext_total = int.from_bytes(payload[idx:idx+2], "big"); idx += 2
         end = min(idx + ext_total, len(payload))
         while idx + 4 <= end:
             et = int.from_bytes(payload[idx:idx+2], "big")
             el = int.from_bytes(payload[idx+2:idx+4], "big")
             idx += 4
-            if idx + el > len(payload):
-                return None
+            if idx + el > len(payload): return None
             if et == 0x0000 and el >= 5:
                 block = payload[idx:idx+el]
                 nlen = int.from_bytes(block[3:5], "big")
                 return block[5:5+nlen].decode(errors="ignore")
             idx += el
-    except Exception:
-        return None
+    except Exception: return None
     return None
 
 
 # ============================================================
-# ARP sweep with per-packet jitter
+# ARP sweep
 # ============================================================
 
 def arp_sweep(subnet, iface, delay_ms=0, max_hosts=512):
-    if not HAVE_SCAPY:
-        return []
-    try:
-        net = ipaddress.IPv4Network(subnet, strict=False)
-    except Exception:
-        return []
+    if not HAVE_SCAPY: return []
+    try: net = ipaddress.IPv4Network(subnet, strict=False)
+    except Exception: return []
     hosts = [str(h) for h in net.hosts()]
-    if len(hosts) > max_hosts:
-        hosts = hosts[:max_hosts]
-    random.shuffle(hosts)
+    if len(hosts) > max_hosts: hosts = hosts[:max_hosts]
     out = []
-    # individual ARP packets, jittered (looks like normal ARP scanning)
-    for ip in hosts:
+    for i in range(0, len(hosts), 16):
+        chunk = hosts[i:i+16]
         try:
-            pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+            pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=chunk)
             ans, _ = srp(pkt, iface=iface, timeout=1, verbose=False)
             for _, rcv in ans:
                 out.append({"ip": rcv[ARP].psrc, "mac": rcv[ARP].hwsrc})
-        except Exception:
-            continue
-        # 20-80ms between individual probes + delay multiplier
-        time.sleep(random.uniform(0.02, 0.08))
-        if delay_ms > 0 and random.random() < 0.3:
-            sleep_delay(delay_ms)
+        except Exception: continue
+        if not _AGGRESSIVE_TIMING[0]: time.sleep(random.uniform(0.03, 0.1))
+        if delay_ms > 0: sleep_delay(delay_ms)
     return out
 
 
 # ============================================================
-# port scan
+# ports
 # ============================================================
 
 TOP_PORTS_50 = {
     21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
-    80: "http", 110: "pop3", 135: "msrpc", 139: "netbios",
-    143: "imap", 443: "https", 445: "smb", 515: "lpd", 631: "ipp",
-    993: "imaps", 995: "pop3s", 1433: "mssql", 3306: "mysql",
-    3389: "rdp", 5060: "sip", 5061: "sip-tls", 5432: "postgres",
-    5900: "vnc", 8000: "http-alt", 8080: "http-alt", 8081: "http-alt",
-    8443: "https-alt", 8888: "http-alt", 9090: "http-alt",
-    9100: "printer-jd", 10000: "webmin",
+    80: "http", 110: "pop3", 135: "msrpc", 139: "netbios", 143: "imap",
+    389: "ldap", 443: "https", 445: "smb", 464: "kpasswd", 515: "lpd",
+    631: "ipp", 636: "ldaps", 993: "imaps", 995: "pop3s", 1433: "mssql",
+    3306: "mysql", 3389: "rdp", 5060: "sip", 5061: "sip-tls",
+    5432: "postgres", 5900: "vnc", 8000: "http-alt", 8080: "http-alt",
+    8081: "http-alt", 8443: "https-alt", 8888: "http-alt",
+    9090: "http-alt", 9100: "printer-jd", 10000: "webmin",
 }
 TOP_PORTS_20 = {k: TOP_PORTS_50[k] for k in [
     21, 22, 23, 53, 80, 110, 139, 143, 443, 445, 993, 995,
     3306, 3389, 5060, 5432, 8080, 8443, 9090, 9100]}
+
+PRINTER_PORTS = (9100, 631, 515)
 
 
 def grab_banner(ip, port, timeout=2.5):
@@ -1221,71 +1053,118 @@ def grab_banner(ip, port, timeout=2.5):
         b = b""
         if port in (80, 8000, 8080, 8081, 8888, 9090):
             try:
-                s.sendall(
-                    ("GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\n"
-                     "Accept: */*\r\nAccept-Language: {}\r\n"
-                     "Connection: close\r\n\r\n").format(
-                        ip, _ua(), _accept_lang()).encode()
-                )
-            except Exception:
-                pass
-        # hold briefly even on no response — looks like a normal TCP client
+                s.sendall(("GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\n"
+                           "Accept: */*\r\nAccept-Language: {}\r\n"
+                           "Connection: close\r\n\r\n").format(
+                               ip, _ua(), _accept_lang()).encode())
+            except Exception: pass
         try:
             s.settimeout(timeout)
             d = s.recv(2048)
-            if d:
-                b = d
-        except Exception:
-            pass
-        time.sleep(random.uniform(0.05, 0.2))
+            if d: b = d
+        except Exception: pass
+        if not b and not _AGGRESSIVE_TIMING[0]:
+            time.sleep(random.uniform(0.05, 0.15))
         s.close()
-        if b:
-            return b.decode("latin-1", errors="ignore").strip()
-    except Exception:
-        pass
+        if b: return b.decode("latin-1", errors="ignore").strip()
+    except Exception: pass
     return None
 
 
-def tls_fingerprint(ip, port, timeout=3):
+def tls_weakness(ip, port=443, timeout=4):
+    """Check supported TLS versions + cipher weaknesses + cert issues."""
+    result = {"protocols": {}, "weak": [], "cert": {}, "score": 0}
+    for proto, pname in [(ssl.TLSVersion.TLSv1, "TLSv1.0"),
+                          (ssl.TLSVersion.TLSv1_1, "TLSv1.1"),
+                          (ssl.TLSVersion.TLSv1_2, "TLSv1.2"),
+                          (ssl.TLSVersion.TLSv1_3, "TLSv1.3")]:
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ctx.minimum_version = proto
+            ctx.maximum_version = proto
+            s = socket.create_connection((ip, port), timeout=timeout)
+            ss = ctx.wrap_socket(s, server_hostname=ip)
+            cipher = ss.cipher()
+            result["protocols"][pname] = cipher[0] if cipher else "?"
+            if pname in ("TLSv1.0", "TLSv1.1"):
+                result["weak"].append("supports {}".format(pname))
+            if cipher and any(x in cipher[0] for x in
+                              ("RC4", "3DES", "DES", "EXPORT", "NULL", "MD5")):
+                result["weak"].append("weak cipher: {}".format(cipher[0]))
+            ss.close()
+        except Exception:
+            result["protocols"][pname] = None
+    # cert
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         s = socket.create_connection((ip, port), timeout=timeout)
         ss = ctx.wrap_socket(s, server_hostname=ip)
-        r = {"tls_version": ss.version(),
-             "cipher": ss.cipher()[0] if ss.cipher() else None}
-        try:
-            cert = ss.getpeercert()
-            if cert:
-                r["subject"] = dict(x[0] for x in cert.get("subject", []))
-                r["issuer"] = dict(x[0] for x in cert.get("issuer", []))
-                r["notAfter"] = cert.get("notAfter")
-        except Exception:
-            pass
+        cert = ss.getpeercert()
         ss.close()
-        return r
+        if cert:
+            subj = dict(x[0] for x in cert.get("subject", []))
+            result["cert"]["subject"] = subj
+            result["cert"]["issuer"] = dict(x[0] for x in cert.get("issuer", []))
+            result["cert"]["notAfter"] = cert.get("notAfter")
+            result["cert"]["san"] = cert.get("subjectAltName", [])
+            if subj.get("commonName") == result["cert"]["issuer"].get("commonName"):
+                result["weak"].append("self-signed certificate")
+            try:
+                exp = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                days = (exp - datetime.utcnow()).days
+                result["cert"]["days_left"] = days
+                if days < 0: result["weak"].append("CERT EXPIRED")
+                elif days < 30: result["weak"].append("cert expires in {} days".format(days))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    result["score"] = max(0, 100 - len(result["weak"]) * 20)
+    return result if result["protocols"] else None
+
+
+def http_security_audit(ip, port=80, scheme="http", timeout=3):
+    """Check HTTP security headers."""
+    checks = {
+        "Strict-Transport-Security": "HSTS missing",
+        "Content-Security-Policy": "CSP missing",
+        "X-Frame-Options": "clickjacking protection missing",
+        "X-Content-Type-Options": "MIME sniffing protection missing",
+        "Referrer-Policy": "referrer policy missing",
+        "Permissions-Policy": "permissions policy missing",
+    }
+    result = {"present": {}, "missing": [], "score": 0}
+    try:
+        url = "{}://{}:{}/".format(scheme, ip, port)
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("User-Agent", _ua())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+        for h, msg in checks.items():
+            if h.lower() in headers:
+                result["present"][h] = headers[h.lower()]
+            else:
+                result["missing"].append(msg)
+        result["score"] = max(0, 100 - len(result["missing"]) * 15)
     except Exception:
         return None
+    return result
 
 
 def smb_negotiate(ip, port=445, timeout=3):
     try:
         s = socket.create_connection((ip, port), timeout=timeout)
-        smb = (b"\x00\x00\x00\x85" + b"\xffSMB" + b"\x72" +
-               b"\x00\x00\x00\x00" + b"\x18" + b"\x53\xc8" +
-               b"\x00\x00" + b"\x00"*8 + b"\x00\x00" + b"\x00\x00" +
-               b"\x00\x00" + b"\x00\x00" + b"\x00\x00" + b"\x00" +
-               b"\x62\x00" + b"\x02NT LM 0.12\x00" +
-               b"\x02SMB 2.002\x00" + b"\x02SMB 2.???\x00")
-        s.sendall(smb)
-        s.settimeout(timeout)
-        d = s.recv(1024)
-        s.close()
-        if not d or len(d) < 8:
-            return None
-        r = {}
-        magic = d[4:8]
+        smb = (b"\x00\x00\x00\x85" + b"\xffSMB" + b"\x72" + b"\x00\x00\x00\x00" +
+               b"\x18" + b"\x53\xc8" + b"\x00\x00" + b"\x00"*8 + b"\x00\x00" +
+               b"\x00\x00" + b"\x00\x00" + b"\x00\x00" + b"\x00\x00" + b"\x00" +
+               b"\x62\x00" + b"\x02NT LM 0.12\x00" + b"\x02SMB 2.002\x00" + b"\x02SMB 2.???\x00")
+        s.sendall(smb); s.settimeout(timeout); d = s.recv(1024); s.close()
+        if not d or len(d) < 8: return None
+        r = {}; magic = d[4:8]
         if magic == b"\xffSMB":
             r["version"] = "SMB1"
             try:
@@ -1295,44 +1174,40 @@ def smb_negotiate(ip, port=445, timeout=3):
                 if body:
                     osl = body[0]
                     r["server_os"] = body[1:1+osl].decode("latin-1", errors="ignore")
-            except Exception:
-                pass
-        elif magic == b"\xfeSMB":
-            r["version"] = "SMB2/3"
-        else:
-            r["version"] = "unknown"
+            except Exception: pass
+        elif magic == b"\xfeSMB": r["version"] = "SMB2/3"
+        else: r["version"] = "unknown"
         return r
-    except Exception:
-        return None
+    except Exception: return None
 
 
-def scan_host(ip, port_map, do_nvd=True, delay_ms=0):
+def scan_host(ip, port_map, do_nvd=True, delay_ms=0, audit_tls=True, audit_http=True):
     ports_out = []
-    # shuffle ports so scan order is different per host
     port_list = list(port_map.keys())
     random.shuffle(port_list)
     for port in port_list:
         banner = grab_banner(ip, port)
         sleep_delay(delay_ms)
-        if banner is None:
-            continue
+        if banner is None: continue
         entry = {"port": port, "service": port_map.get(port, "?"),
                  "banner": banner[:300], "products": [], "extra": {}}
         for prod, ver in detect_product_version(banner):
             cves = nvd_lookup(prod, ver) if do_nvd else []
             entry["products"].append({"product": prod, "version": ver, "cves": cves})
-        if port in (443, 8443):
-            t = tls_fingerprint(ip, port)
-            if t: entry["extra"]["tls"] = t
+        if port in (443, 8443) and audit_tls:
+            entry["extra"]["tls_weak"] = tls_weakness(ip, port)
         elif port == 445:
             s = smb_negotiate(ip, port)
             if s:
                 entry["extra"]["smb"] = s
                 if s.get("server_os") and do_nvd:
                     for prod, ver in detect_product_version(s["server_os"]):
-                        entry["products"].append({
-                            "product": prod, "version": ver,
-                            "cves": nvd_lookup(prod, ver)})
+                        entry["products"].append({"product": prod, "version": ver,
+                                                   "cves": nvd_lookup(prod, ver)})
+        if port in (80, 8080, 8000, 8888) and audit_http:
+            entry["extra"]["http_sec"] = http_security_audit(ip, port, "http")
+        elif port in (443, 8443) and audit_http:
+            entry["extra"]["http_sec"] = http_security_audit(ip, port, "https")
         ports_out.append(entry)
     return ports_out
 
@@ -1349,44 +1224,49 @@ SNMP_OIDS = {
 
 
 def snmp_probe(ip, community="public", timeout=2):
-    if not HAVE_SNMP:
-        return None
+    if not HAVE_SNMP: return None
     out = {}
     for label, oid in SNMP_OIDS.items():
         try:
-            ei, es, _, vb = next(getCmd(
-                SnmpEngine(),
+            ei, es, _, vb = next(getCmd(SnmpEngine(),
                 CommunityData(community, mpModel=1),
                 UdpTransportTarget((ip, 161), timeout=timeout, retries=0),
                 ContextData(), ObjectType(ObjectIdentity(oid))))
-            if ei or es:
-                continue
-            for _, v in vb:
-                out[label] = str(v)
-        except Exception:
-            continue
+            if ei or es: continue
+            for _, v in vb: out[label] = str(v)
+        except Exception: continue
     return out if out else None
 
 
+def snmp_uptime_human(sysuptime_str):
+    """Parse SNMP sysUpTime (TimeTicks in hundredths of a sec) to human + days."""
+    try:
+        ticks = int(sysuptime_str.split("(")[-1].rstrip(")") if "(" in sysuptime_str else sysuptime_str)
+        secs = ticks / 100.0
+        days = secs / 86400
+        human = format_uptime(int(secs))
+        warn = None
+        if days > 730:  # 2 years
+            warn = "device up {} (likely stale firmware)".format(human)
+        return {"human": human, "days": round(days, 1), "warning": warn}
+    except Exception:
+        return None
+
+
 def snmp_walk(ip, base_oid, community="public", max_rows=100, timeout=2):
-    if not HAVE_SNMP:
-        return []
+    if not HAVE_SNMP: return []
     out = []
     try:
-        for ei, es, _, vb in nextCmd(
-                SnmpEngine(),
+        for ei, es, _, vb in nextCmd(SnmpEngine(),
                 CommunityData(community, mpModel=1),
                 UdpTransportTarget((ip, 161), timeout=timeout, retries=0),
                 ContextData(), ObjectType(ObjectIdentity(base_oid)),
                 lexicographicMode=False):
-            if ei or es:
-                break
+            if ei or es: break
             for name, val in vb:
                 out.append((str(name), str(val)))
-                if len(out) >= max_rows:
-                    return out
-    except Exception:
-        pass
+                if len(out) >= max_rows: return out
+    except Exception: pass
     return out
 
 
@@ -1394,10 +1274,8 @@ def snmp_walk_interfaces(ip, community="public"):
     idxs = snmp_walk(ip, "1.3.6.1.2.1.2.2.1.1", community, max_rows=64)
     out = []
     for _, v in idxs:
-        try:
-            pi = int(v)
-        except Exception:
-            continue
+        try: pi = int(v)
+        except Exception: continue
         info = {"idx": pi}
         d = snmp_walk(ip, "1.3.6.1.2.1.2.2.1.2.{}".format(pi), community, max_rows=1)
         if d: info["descr"] = d[0][1]
@@ -1412,10 +1290,8 @@ def snmp_walk_arp(ip, community="public"):
     for oid, val in snmp_walk(ip, "1.3.6.1.2.1.4.22.1.2", community, max_rows=256):
         try:
             parts = oid.split(".")[-4:]
-            if len(parts) == 4:
-                out.append({"ip": ".".join(parts), "mac": val})
-        except Exception:
-            pass
+            if len(parts) == 4: out.append({"ip": ".".join(parts), "mac": val})
+        except Exception: pass
     return out
 
 
@@ -1426,9 +1302,8 @@ def snmp_walk_arp(ip, community="public"):
 def upnp_igd_query(router_ip, timeout=3):
     r = {"control_url": None, "external_ip": None}
     try:
-        with urllib.request.urlopen(
-                "http://{}:1900/gatedesc.xml".format(router_ip),
-                timeout=timeout) as resp:
+        with urllib.request.urlopen("http://{}:1900/gatedesc.xml".format(router_ip),
+                                     timeout=timeout) as resp:
             xml = resp.read()
         root = ET.fromstring(xml)
         ctrl = None
@@ -1438,8 +1313,7 @@ def upnp_igd_query(router_ip, timeout=3):
                 c = svc.find("{urn:schemas-upnp-org:device-1-0}controlURL")
                 if c is not None and c.text:
                     ctrl = c.text.strip(); break
-        if not ctrl:
-            return r
+        if not ctrl: return r
         r["control_url"] = ctrl
         if not ctrl.startswith("http"):
             ctrl = "http://{}{}".format(router_ip, ctrl)
@@ -1456,20 +1330,17 @@ def upnp_igd_query(router_ip, timeout=3):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8", errors="ignore")
         m = re.search(r"<NewExternalIPAddress>([^<]+)</NewExternalIPAddress>", text)
-        if m:
-            r["external_ip"] = m.group(1)
-    except Exception:
-        pass
+        if m: r["external_ip"] = m.group(1)
+    except Exception: pass
     return r
 
 
 # ============================================================
-# DNS SRV + AXFR (fixed TCP read)
+# DNS SRV + AXFR + wildcard
 # ============================================================
 
 def dns_srv_enum(domain, dns_server=None, timeout=2):
-    if not HAVE_SCAPY or not domain:
-        return []
+    if not HAVE_SCAPY or not domain: return []
     out = []
     for srv in ["_ldap._tcp", "_kerberos._tcp", "_gc._tcp", "_sip._udp"]:
         q = "{}.{}".format(srv, domain)
@@ -1478,28 +1349,49 @@ def dns_srv_enum(domain, dns_server=None, timeout=2):
                 rd=1, qd=DNSQR(qname=q, qtype="SRV"))
             ans = sr1(pkt, timeout=timeout, verbose=False)
             sleep_delay(200)
-            if not ans or not ans.haslayer(DNS):
-                continue
+            if not ans or not ans.haslayer(DNS): continue
             rr = ans[DNS].an; g = 0
             while rr is not None and g < 10:
                 g += 1
                 try:
                     if int(rr.type) == 33:
                         tgt = rr.rdata.target
-                        if isinstance(tgt, bytes):
-                            tgt = tgt.decode(errors="ignore")
+                        if isinstance(tgt, bytes): tgt = tgt.decode(errors="ignore")
                         out.append({"srv": srv, "domain": domain,
                                     "target": str(tgt).rstrip("."),
                                     "port": rr.rdata.port})
-                except Exception:
-                    pass
+                except Exception: pass
                 nxt = getattr(rr, "payload", None)
-                if nxt is None or isinstance(nxt, DNS):
-                    break
+                if nxt is None or isinstance(nxt, DNS): break
                 rr = nxt
-        except Exception:
-            continue
+        except Exception: continue
     return out
+
+
+def dns_wildcard_check(domain, dns_server=None, timeout=3):
+    """Query random subdomain — if it resolves, wildcard exists."""
+    if not HAVE_SCAPY or not domain: return None
+    try:
+        random_sub = "nonexistent-{}.{}".format(random.randint(100000, 999999), domain)
+        pkt = IP(dst=dns_server or "8.8.8.8") / UDP(dport=53) / DNS(
+            rd=1, qd=DNSQR(qname=random_sub, qtype="A"))
+        ans = sr1(pkt, timeout=timeout, verbose=False)
+        if not ans or not ans.haslayer(DNS): return {"wildcard": False}
+        dns = ans[DNS]
+        if dns.ancount and dns.ancount > 0:
+            ips = []
+            rr = dns.an; g = 0
+            while rr is not None and g < 10:
+                g += 1
+                try:
+                    if int(rr.type) == 1: ips.append(str(rr.rdata))
+                except Exception: pass
+                nxt = getattr(rr, "payload", None)
+                if nxt is None or isinstance(nxt, DNS): break
+                rr = nxt
+            if ips: return {"wildcard": True, "resolves_to": ips}
+        return {"wildcard": False}
+    except Exception: return None
 
 
 def _encode_dns_name(name):
@@ -1512,234 +1404,298 @@ def _encode_dns_name(name):
 def _recv_exact(sock, n, deadline):
     buf = b""
     while len(buf) < n and time.time() < deadline:
-        try:
-            chunk = sock.recv(n - len(buf))
-        except socket.timeout:
-            break
-        if not chunk:
-            break
+        try: chunk = sock.recv(n - len(buf))
+        except socket.timeout: break
+        if not chunk: break
         buf += chunk
     return buf
 
 
 def dns_zone_transfer(domain, dns_server, timeout=5):
-    """
-    AXFR over TCP with proper length-prefixed framing.
-    Reads messages one at a time until timeout or EOF.
-    """
-    result = {"attempted": True, "success": False, "records": []}
+    result = {"attempted": True, "success": False, "records": [], "soa_count": 0}
     if not domain or not dns_server:
-        result["attempted"] = False
-        return result
+        result["attempted"] = False; return result
     try:
         qid = random.randint(1, 65535)
         question = _encode_dns_name(domain) + struct.pack(">HH", 252, 1)
         header = struct.pack(">HHHHHH", qid, 0, 1, 0, 0, 0)
         msg = header + question
-
         sock = socket.create_connection((dns_server, 53), timeout=timeout)
         sock.settimeout(timeout)
         sock.sendall(struct.pack(">H", len(msg)) + msg)
-
         deadline = time.time() + timeout
         while time.time() < deadline:
             prefix = _recv_exact(sock, 2, deadline)
-            if len(prefix) < 2:
-                break
+            if len(prefix) < 2: break
             mlen = struct.unpack(">H", prefix)[0]
-            if mlen == 0 or mlen > 65000:
-                break
+            if mlen == 0 or mlen > 65000: break
             body = _recv_exact(sock, mlen, deadline)
-            if len(body) < mlen:
-                break
-            # parse minimal answer count + record types
+            if len(body) < mlen: break
+            result["records"].append({"len": len(body)})
+            # quick SOA count
             try:
                 an = struct.unpack(">H", body[6:8])[0]
-                if an == 0:
-                    break
-                for _ in range(an):
-                    result["records"].append({"len": len(body)})
-                # check last record: SOA returns twice to end AXFR
-            except Exception:
-                continue
+                if b"\x00\x06" in body: result["soa_count"] += an
+            except Exception: pass
+            if result["soa_count"] >= 2: break
         sock.close()
-        if result["records"]:
-            result["success"] = True
-    except Exception as e:
-        result["error"] = str(e)
+        if result["records"]: result["success"] = True
+    except Exception as e: result["error"] = str(e)
     return result
 
 
 # ============================================================
-# mDNS deep enum (sniff BEFORE send)
+# mDNS deep enum with SRV + TXT
 # ============================================================
 
 MDNS_SERVICES = [
-    "_services._dns-sd._udp.local",
-    "_http._tcp.local", "_https._tcp.local",
-    "_ipp._tcp.local", "_printer._tcp.local",
-    "_afpovertcp._tcp.local", "_smb._tcp.local",
-    "_ssh._tcp.local", "_sftp-ssh._tcp.local",
-    "_airplay._tcp.local", "_raop._tcp.local",
-    "_googlecast._tcp.local",
-    "_homekit._tcp.local", "_hap._tcp.local",
-    "_workstation._tcp.local",
+    "_services._dns-sd._udp.local", "_http._tcp.local", "_https._tcp.local",
+    "_ipp._tcp.local", "_printer._tcp.local", "_afpovertcp._tcp.local",
+    "_smb._tcp.local", "_ssh._tcp.local", "_airplay._tcp.local",
+    "_raop._tcp.local", "_googlecast._tcp.local", "_homekit._tcp.local",
+    "_hap._tcp.local", "_workstation._tcp.local",
 ]
 
 
 def mdns_deep_enum(iface, timeout=8):
-    if not HAVE_SCAPY:
-        return []
+    if not HAVE_SCAPY: return []
     print("mDNS deep enum ({}s)...".format(timeout), file=sys.stderr)
-    results = []
-    seen = set()
+    results = []; seen = set(); start = time.time()
 
-    # start sniff FIRST in a background thread
-    stop_flag = threading.Event()
-    collected = []
-
-    def sniff_thread():
+    def on_pkt(pkt):
         try:
-            pkts = sc_sniff(iface=iface, timeout=timeout,
-                            stop_filter=lambda p: stop_flag.is_set(),
-                            store=True, filter="udp port 5353")
-            for p in pkts:
-                try:
-                    if p.haslayer(DNS) and p[DNS].qr == 1:
-                        src = p[IP].src if p.haslayer(IP) else None
-                        rr = p[DNS].an; g = 0
-                        while rr is not None and g < 20:
-                            g += 1
+            if pkt.haslayer(DNS) and pkt[DNS].qr == 1:
+                src = pkt[IP].src if pkt.haslayer(IP) else None
+                rr = pkt[DNS].an; g = 0
+                while rr is not None and g < 20:
+                    g += 1
+                    try:
+                        rtype = int(rr.type)
+                        name = rr.rrname
+                        if isinstance(name, bytes): name = name.decode(errors="ignore")
+                        name = str(name).rstrip(".")
+                        entry = {"ip": src, "name": name, "type": rtype}
+                        if rtype == 12:  # PTR
+                            data = rr.rdata
+                            if isinstance(data, bytes): data = data.decode(errors="ignore")
+                            entry["ptr"] = str(data).rstrip(".")
+                        elif rtype == 33:  # SRV
+                            entry["srv_target"] = str(rr.rdata.target).rstrip(".")
+                            entry["srv_port"] = rr.rdata.port
+                            entry["srv_priority"] = rr.rdata.priority
+                            entry["srv_weight"] = rr.rdata.weight
+                        elif rtype == 16:  # TXT
                             try:
-                                name = rr.rrname
-                                if isinstance(name, bytes):
-                                    name = name.decode(errors="ignore")
-                                rdata = rr.rdata
-                                if isinstance(rdata, bytes):
-                                    rdata = rdata.decode(errors="ignore")
-                                key = (src, str(name), str(rdata))
-                                if key not in seen:
-                                    seen.add(key)
-                                    collected.append({"ip": src,
-                                                      "name": str(name).rstrip("."),
-                                                      "data": str(rdata).rstrip(".")})
-                            except Exception:
-                                pass
-                            nxt = getattr(rr, "payload", None)
-                            if nxt is None or isinstance(nxt, DNS):
-                                break
-                            rr = nxt
-                except Exception:
-                    continue
-        except Exception:
-            pass
+                                txts = []
+                                for t in rr.rdata:
+                                    if isinstance(t, bytes): t = t.decode(errors="ignore")
+                                    txts.append(str(t))
+                                entry["txt"] = txts
+                            except Exception: pass
+                        elif rtype in (1, 28):  # A/AAAA
+                            entry["addr"] = str(rr.rdata)
+                        key = (src, name, str(entry))
+                        if key not in seen:
+                            seen.add(key); results.append(entry)
+                    except Exception: pass
+                    nxt = getattr(rr, "payload", None)
+                    if nxt is None or isinstance(nxt, DNS): break
+                    rr = nxt
+        except Exception: pass
 
-    t = threading.Thread(target=sniff_thread, daemon=True)
-    t.start()
-    time.sleep(0.2)  # let sniffer start
+    try:
+        sniffer = AsyncSniffer(iface=iface, filter="udp port 5353",
+                                prn=on_pkt, store=False)
+        sniffer.start()
+    except Exception: return []
 
+    time.sleep(0.2)
     for svc in MDNS_SERVICES:
+        if time.time() - start >= timeout - 0.5: break
         try:
-            pkt = (Ether(dst="01:00:5e:00:00:fb") /
-                   IP(dst="224.0.0.251", ttl=255) /
+            pkt = (Ether(dst="01:00:5e:00:00:fb") / IP(dst="224.0.0.251", ttl=255) /
                    UDP(sport=5353, dport=5353) /
                    DNS(id=0, qr=0, qdcount=1,
                        qd=DNSQR(qname=svc, qtype="PTR", qclass=0x0001)))
             sendp(pkt, iface=iface, verbose=False)
-            time.sleep(random.uniform(0.3, 0.7))
-        except Exception:
-            pass
-
-    t.join(timeout=timeout + 2)
-    stop_flag.set()
-    return collected
+            if not _AGGRESSIVE_TIMING[0]: time.sleep(random.uniform(0.2, 0.4))
+        except Exception: pass
+    remaining = timeout - (time.time() - start)
+    if remaining > 0: time.sleep(remaining)
+    try: sniffer.stop()
+    except Exception: pass
+    return list(results)
 
 
 # ============================================================
-# crt.sh + BGP
+# NTP enumeration
+# ============================================================
+
+def ntp_query(ip, timeout=2):
+    """Query NTP server for stratum, ref, drift."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        pkt = b"\x1b" + b"\x00" * 47
+        s.sendto(pkt, (ip, 123))
+        data, _ = s.recvfrom(512)
+        s.close()
+        if len(data) < 48: return None
+        stratum = data[1]
+        poll = data[2]
+        precision = data[3]
+        # root delay at 4-8, root dispersion at 8-12
+        root_delay = struct.unpack(">I", data[4:8])[0] / 65536.0
+        root_disp = struct.unpack(">I", data[8:12])[0] / 65536.0
+        ref_id = data[12:16]
+        # tx timestamp 40-48
+        tx_sec = struct.unpack(">I", data[40:44])[0]
+        epoch = tx_sec - 2208988800  # NTP epoch offset
+        return {
+            "ip": ip, "stratum": stratum, "poll": poll,
+            "precision": precision,
+            "root_delay_ms": round(root_delay * 1000, 2),
+            "root_dispersion_ms": round(root_disp * 1000, 2),
+            "ref_id": ref_id.hex(),
+            "ref_id_ascii": "".join(chr(b) if 32 <= b < 127 else "." for b in ref_id),
+            "server_time_utc": datetime.utcfromtimestamp(epoch).isoformat() if epoch > 0 else None,
+            "clock_skew_s": round(time.time() - epoch, 1) if epoch > 0 else None,
+        }
+    except Exception: return None
+
+
+# ============================================================
+# Kerberos + LDAP
+# ============================================================
+
+def kerberos_realm(domain, dns_server=None, timeout=3):
+    """Query _kerberos._udp TXT to get realm name."""
+    if not HAVE_SCAPY or not domain: return None
+    try:
+        q = "_kerberos._udp.{}".format(domain)
+        pkt = IP(dst=dns_server or "8.8.8.8") / UDP(dport=53) / DNS(
+            rd=1, qd=DNSQR(qname=q, qtype="TXT"))
+        ans = sr1(pkt, timeout=timeout, verbose=False)
+        if not ans or not ans.haslayer(DNS): return None
+        rr = ans[DNS].an; g = 0
+        while rr is not None and g < 10:
+            g += 1
+            try:
+                if int(rr.type) == 16:
+                    txt = rr.rdata
+                    if isinstance(txt, bytes): txt = txt.decode(errors="ignore")
+                    elif isinstance(txt, list):
+                        txt = "".join(t.decode() if isinstance(t, bytes) else str(t) for t in txt)
+                    return str(txt).strip('"')
+            except Exception: pass
+            nxt = getattr(rr, "payload", None)
+            if nxt is None or isinstance(nxt, DNS): break
+            rr = nxt
+    except Exception: pass
+    return None
+
+
+def ldap_anon_bind(ip, port=389, timeout=3):
+    """Try anonymous bind. Returns True if server accepts."""
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout)
+        # LDAP BindRequest: version 3, anonymous (empty DN + empty password)
+        # 0x30 = SEQUENCE, 0x0c = size 12
+        # messageID=1 (0x02 0x01 0x01)
+        # BindRequest (0x60 0x07 0x02 0x01 0x03 0x04 0x00 0x80 0x00)
+        msg = b"\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00"
+        s.sendall(msg)
+        s.settimeout(timeout)
+        resp = s.recv(1024)
+        s.close()
+        if len(resp) > 10:
+            # parse resultCode (offset varies, but check for success 0x00)
+            # BindResponse (0x61) -> resultCode near end
+            if b"\x61" in resp:
+                idx = resp.find(b"\x61")
+                if idx + 5 < len(resp):
+                    # look for enumerated resultCode 0x0a 0x01 0x00
+                    rc_idx = resp.find(b"\x0a\x01", idx)
+                    if rc_idx > 0 and rc_idx + 2 < len(resp):
+                        return resp[rc_idx + 2] == 0
+        return False
+    except Exception: return False
+
+
+# ============================================================
+# crt.sh + BGP + public IP
 # ============================================================
 
 def crt_sh_lookup(domain, timeout=20, max_results=500):
-    if not HAVE_REQUESTS or not domain:
-        return []
+    if not HAVE_REQUESTS or not domain: return []
     try:
-        r = requests.get(
-            "https://crt.sh/?q=%25.{}&output=json".format(domain),
-            timeout=timeout,
-            headers={"User-Agent": _ua()})
-        if r.status_code != 200:
-            return []
+        r = requests.get("https://crt.sh/?q=%25.{}&output=json&exclude=expired".format(domain),
+                          timeout=timeout, headers={"User-Agent": _ua()})
+        if r.status_code != 200: return []
         data = r.json()
-    except Exception:
-        return []
+    except Exception: return []
     domains = set()
     for entry in data:
         name = entry.get("name_value", "")
         for line in str(name).split("\n"):
-            line = line.strip().lower()
+            line = line.strip().lower().rstrip(",").strip(".")
             if line and line != domain and "*" not in line:
                 domains.add(line)
-                if len(domains) >= max_results:
-                    break
-        if len(domains) >= max_results:
-            break
+                if len(domains) >= max_results: break
+        if len(domains) >= max_results: break
     return sorted(domains)
 
 
 def bgp_lookup(ip_or_prefix, timeout=15):
-    if not HAVE_REQUESTS or not ip_or_prefix:
-        return {}
+    if not HAVE_REQUESTS or not ip_or_prefix: return {}
     try:
-        r = requests.get(
-            "https://stat.ripe.net/data/prefix-overview/data.json",
-            params={"resource": ip_or_prefix},
-            timeout=timeout,
-            headers={"User-Agent": _ua()})
-        if r.status_code != 200:
-            return {}
+        r = requests.get("https://stat.ripe.net/data/prefix-overview/data.json",
+                          params={"resource": ip_or_prefix}, timeout=timeout,
+                          headers={"User-Agent": _ua()})
+        if r.status_code != 200: return {}
         data = r.json().get("data", {})
-        return {
-            "prefix": data.get("resource"),
-            "asns": [{"asn": a.get("asn"), "holder": a.get("holder")}
-                     for a in data.get("asns", [])],
-        }
-    except Exception:
-        return {}
+        return {"prefix": data.get("resource"),
+                "asns": [{"asn": a.get("asn"), "holder": a.get("holder")}
+                         for a in data.get("asns", [])]}
+    except Exception: return {}
+
+
+def get_public_ip(timeout=5):
+    if not HAVE_REQUESTS: return None
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://ipinfo.io/ip"):
+        try:
+            r = requests.get(url, timeout=timeout, headers={"User-Agent": _ua()})
+            if r.status_code == 200:
+                ip = r.text.strip()
+                if is_ipv4(ip): return ip
+        except Exception: continue
+    return None
 
 
 # ============================================================
-# SIP / printer / nmap-style OS
+# SIP / printer / nmap OS
 # ============================================================
 
 def sip_scan(ip, port=5060, timeout=2):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(timeout)
-        msg = ("OPTIONS sip:probe@{} SIP/2.0\r\n"
-               "Via: SIP/2.0/UDP {}\r\n"
-               "From: <sip:probe@{}>;tag=recon\r\n"
-               "To: <sip:probe@{}>\r\n"
-               "Call-ID: recon@recon\r\n"
-               "CSeq: 1 OPTIONS\r\n"
-               "Contact: <sip:probe@{}>\r\n"
-               "Max-Forwards: 70\r\n"
-               "User-Agent: recon\r\n"
-               "Content-Length: 0\r\n\r\n").format(ip, ip, ip, ip, ip)
+        msg = ("OPTIONS sip:probe@{} SIP/2.0\r\nVia: SIP/2.0/UDP {}\r\n"
+               "From: <sip:probe@{}>;tag=recon\r\nTo: <sip:probe@{}>\r\n"
+               "Call-ID: recon@recon\r\nCSeq: 1 OPTIONS\r\n"
+               "Contact: <sip:probe@{}>\r\nMax-Forwards: 70\r\n"
+               "User-Agent: recon\r\nContent-Length: 0\r\n\r\n").format(ip, ip, ip, ip, ip)
         s.sendto(msg.encode(), (ip, port))
         try:
             data, _ = s.recvfrom(2048)
             text = data.decode("latin-1", errors="ignore")
             server = None
             for line in text.splitlines():
-                if line.lower().startswith("server:"):
-                    server = line.split(":", 1)[1].strip()
-            return {"port": port, "server": server, "response": text[:200]}
-        except socket.timeout:
-            return None
-        finally:
-            s.close()
-    except Exception:
-        return None
+                if line.lower().startswith("server:"): server = line.split(":", 1)[1].strip()
+            return {"port": port, "server": server}
+        except socket.timeout: return None
+        finally: s.close()
+    except Exception: return None
 
 
 def printer_enum(ip, timeout=2):
@@ -1748,71 +1704,50 @@ def printer_enum(ip, timeout=2):
         s = socket.create_connection((ip, 9100), timeout=timeout)
         s.sendall(b"\x1b%-12345X@PJL INFO ID\r\n\x1b%-12345X")
         s.settimeout(timeout)
-        data = s.recv(512)
-        s.close()
-        if data:
-            out["jetdirect"] = data.decode("latin-1", errors="ignore").strip()[:300]
-    except Exception:
-        pass
+        d = s.recv(512); s.close()
+        if d: out["jetdirect"] = d.decode("latin-1", errors="ignore").strip()[:300]
+    except Exception: pass
     try:
         s = socket.create_connection((ip, 631), timeout=timeout)
-        s.sendall(("GET / HTTP/1.0\r\nHost: {}\r\nUser-Agent: {}\r\n\r\n").format(
-            ip, _ua()).encode())
+        s.sendall(("GET / HTTP/1.0\r\nHost: {}\r\nUser-Agent: {}\r\n\r\n").format(ip, _ua()).encode())
         s.settimeout(timeout)
-        data = s.recv(512)
-        s.close()
-        if data:
-            out["ipp"] = data.decode("latin-1", errors="ignore")[:200]
-    except Exception:
-        pass
+        d = s.recv(512); s.close()
+        if d: out["ipp"] = d.decode("latin-1", errors="ignore")[:200]
+    except Exception: pass
     try:
         s = socket.create_connection((ip, 515), timeout=timeout)
         s.sendall(b"\x03recon\n")
         s.settimeout(timeout)
-        data = s.recv(512)
-        s.close()
-        if data:
-            out["lpd"] = data.decode("latin-1", errors="ignore")[:200]
-    except Exception:
-        pass
+        d = s.recv(512); s.close()
+        if d: out["lpd"] = d.decode("latin-1", errors="ignore")[:200]
+    except Exception: pass
     return out if any(v for v in out.values()) else None
 
 
 def nmap_os_detect(ip, timeout=3):
-    """Active OS detection, realistic SYN profiles, TTL from ICMP too."""
-    if not HAVE_SCAPY:
-        return None
-    result = {}
-    prof = _random_syn_profile()
+    if not HAVE_SCAPY: return None
+    result = {}; prof = _random_syn_profile()
     try:
-        pkt = IP(dst=ip, ttl=prof["ttl"]) / TCP(
-            dport=80, flags="S", window=prof["window"],
-            options=prof["options"])
+        pkt = IP(dst=ip, ttl=prof["ttl"]) / TCP(dport=80, flags="S",
+                window=prof["window"], options=prof["options"])
         ans = sr1(pkt, timeout=timeout, verbose=False)
         if ans and ans.haslayer(IP):
             ttl = int(ans[IP].ttl)
-            if ttl <= 64:
-                init, hint = 64, "Linux/Unix"
-            elif ttl <= 128:
-                init, hint = 128, "Windows"
-            else:
-                init, hint = 255, "Network device"
-            result["ttl"] = ttl
-            result["initial_ttl"] = init
+            if ttl <= 64: init, hint = 64, "Linux/Unix"
+            elif ttl <= 128: init, hint = 128, "Windows"
+            else: init, hint = 255, "Network device"
+            result["ttl"] = ttl; result["initial_ttl"] = init
             result["hops_inferred"] = init - ttl
             result["hint"] = "{} (ttl {} -> initial {})".format(hint, ttl, init)
-            if ans.haslayer(TCP):
-                result["window"] = int(ans[TCP].window)
+            if ans.haslayer(TCP): result["window"] = int(ans[TCP].window)
             elif ans.haslayer(ICMP):
-                result["icmp_type"] = int(ans[ICMP].type)
-                result["note"] = "port filtered (ICMP unreachable)"
-    except Exception:
-        pass
+                result["icmp_type"] = int(ans[ICMP].type); result["note"] = "port filtered"
+    except Exception: pass
     return result if result else None
 
 
 # ============================================================
-# reverse DNS (throttled)
+# reverse DNS + netbios + wifi
 # ============================================================
 
 def reverse_dns(ip, timeout=0.7):
@@ -1820,34 +1755,19 @@ def reverse_dns(ip, timeout=0.7):
     try:
         socket.setdefaulttimeout(timeout)
         return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return None
-    finally:
-        socket.setdefaulttimeout(old)
+    except Exception: return None
+    finally: socket.setdefaulttimeout(old)
 
 
 def reverse_dns_batch(ips, workers=4, timeout=0.7):
-    """Throttled: max 4 in flight, jitter between batches."""
     out = {}
-    if not ips:
-        return out
-    sem = threading.Semaphore(workers)
-    lock = threading.Lock()
-
-    def _one(ip):
-        with sem:
-            name = reverse_dns(ip, timeout)
-            with lock:
-                out[ip] = name
-            time.sleep(random.uniform(0.02, 0.1))
-
-    threads = []
-    for ip in ips:
-        t = threading.Thread(target=_one, args=(ip,), daemon=True)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join(timeout=timeout + 2)
+    if not ips: return out
+    def _one(ip): return ip, reverse_dns(ip, timeout)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        fs = [ex.submit(_one, ip) for ip in ips]
+        for fut in concurrent.futures.as_completed(fs):
+            try: ip, name = fut.result(); out[ip] = name
+            except Exception: continue
     return out
 
 
@@ -1858,31 +1778,23 @@ def netbios_name(ip):
         q = struct.pack(">HHHHHH", 0x1234, 0x0000, 1, 0, 0, 0)
         q += b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01"
         s.sendto(q, (ip, 137))
-        d, _ = s.recvfrom(1024)
-        s.close()
-        if len(d) < 57:
-            return None
+        d, _ = s.recvfrom(1024); s.close()
+        if len(d) < 57: return None
         for i in range(d[56]):
             b = 57 + i * 18
-            if b + 18 > len(d):
-                break
+            if b + 18 > len(d): break
             n = d[b:b+15].decode("ascii", errors="ignore").strip()
-            if n and n != "\x00":
-                return n
-    except Exception:
-        return None
+            if n and n != "\x00": return n
+    except Exception: return None
 
 
 def wifi_info():
-    if not IS_WIN:
-        return None
+    if not IS_WIN: return None
     text = run("netsh wlan show interfaces")
-    if not text or "no wireless" in text.lower():
-        return None
+    if not text or "no wireless" in text.lower(): return None
     info = {}
     for line in text.splitlines():
-        if ":" not in line:
-            continue
+        if ":" not in line: continue
         k, _, v = line.partition(":")
         k = k.strip().lower(); v = v.strip()
         if k == "ssid" and "ssid" not in info: info["ssid"] = v
@@ -1895,7 +1807,7 @@ def wifi_info():
 
 
 # ============================================================
-# report
+# http enum
 # ============================================================
 
 def http_enum(ip, port=80, timeout=2):
@@ -1903,41 +1815,146 @@ def http_enum(ip, port=80, timeout=2):
     base = "http://{}:{}/".format(ip, port)
     for path in ["/robots.txt", "/server-status", "/admin"]:
         try:
-            req = urllib.request.Request(base.rstrip("/") + path, method="HEAD")
+            method = "GET" if path == "/robots.txt" else "HEAD"
+            req = urllib.request.Request(base.rstrip("/") + path, method=method)
             req.add_header("User-Agent", _ua())
             req.add_header("Accept-Language", _accept_lang())
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 r["paths"].append({"path": path, "status": resp.status})
                 if path == "/robots.txt" and resp.status == 200:
-                    try:
-                        req2 = urllib.request.Request(
-                            base.rstrip("/") + path,
-                            headers={"User-Agent": _ua(),
-                                     "Accept-Language": _accept_lang()})
-                        with urllib.request.urlopen(req2, timeout=timeout) as rr:
-                            r["robots"] = rr.read(2048).decode("utf-8", errors="ignore")
-                    except Exception:
-                        pass
+                    try: r["robots"] = resp.read(2048).decode("utf-8", errors="ignore")
+                    except Exception: pass
             time.sleep(random.uniform(0.1, 0.3))
-        except urllib.error.HTTPError as e:
-            r["paths"].append({"path": path, "status": e.code})
-        except Exception:
-            pass
+        except urllib.error.HTTPError as e: r["paths"].append({"path": path, "status": e.code})
+        except Exception: pass
     try:
         req = urllib.request.Request(base, method="HEAD")
         req.add_header("User-Agent", _ua())
         req.add_header("Accept-Language", _accept_lang())
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             r["headers"] = dict(resp.headers)
-    except Exception:
-        pass
+    except Exception: pass
     return r if r["paths"] or r["headers"] else None
 
 
+# ============================================================
+# DIFF: compare two JSON runs
+# ============================================================
+
+def diff_runs(old_path):
+    try:
+        with open(old_path, "r", encoding="utf-8") as f:
+            old = json.load(f)
+    except Exception as e:
+        print("cannot load {}: {}".format(old_path, e), file=sys.stderr)
+        return
+
+    def host_map(data):
+        return {h.get("ip"): h for h in data.get("hosts", []) if h.get("ip")}
+
+    old_hosts = host_map(old)
+    new_hosts = host_map(RESULTS)
+    old_ips = set(old_hosts.keys())
+    new_ips = set(new_hosts.keys())
+
+    added = new_ips - old_ips
+    removed = old_ips - new_ips
+
+    print("=== DIFF vs {} ===".format(old_path))
+    print("old run: {}".format(old.get("timestamp", "?")))
+    print("new run: {}".format(RESULTS.get("timestamp", "?")))
+    print()
+    print("hosts: {} -> {}".format(len(old_ips), len(new_ips)))
+    if added:
+        print()
+        print("[+] {} new hosts:".format(len(added)))
+        for ip in sorted(added, key=lambda x: ipaddress.IPv4Address(x)):
+            h = new_hosts[ip]
+            print("  {:<16} {:<20} {}".format(ip, h.get("mac", "?"), h.get("vendor", "?")))
+    if removed:
+        print()
+        print("[-] {} hosts gone:".format(len(removed)))
+        for ip in sorted(removed, key=lambda x: ipaddress.IPv4Address(x)):
+            print("  {}".format(ip))
+
+    print()
+    print("=== per-host changes ===")
+    for ip in sorted(new_ips & old_ips, key=lambda x: ipaddress.IPv4Address(x)):
+        oh = old_hosts[ip]; nh = new_hosts[ip]
+        old_ports = {p["port"] for p in oh.get("ports", [])}
+        new_ports = {p["port"] for p in nh.get("ports", [])}
+        po = new_ports - old_ports
+        pd = old_ports - new_ports
+        if po or pd:
+            print("  {}".format(ip))
+            if po: print("    + ports: {}".format(sorted(po)))
+            if pd: print("    - ports: {}".format(sorted(pd)))
+        old_cves = sum(len(p.get("products", [])) and
+                       sum(len(pr.get("cves", [])) for pr in p.get("products", []))
+                       for p in oh.get("ports", []))
+        new_cves = sum(sum(len(pr.get("cves", [])) for pr in p.get("products", []))
+                       for p in nh.get("ports", []))
+        if new_cves != old_cves:
+            print("  {}: CVE count {} -> {}".format(ip, old_cves, new_cves))
+    _result_set("diff_old_path", old_path)
+    _result_set("diff_added", sorted(added))
+    _result_set("diff_removed", sorted(removed))
+
+
+# ============================================================
+# CSV export
+# ============================================================
+
+def export_csv(path=None):
+    if not path:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(LOG_DIR, "recon_{}.csv".format(stamp))
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["ip", "mac", "vendor", "hostname", "os_passive",
+                        "ports_open", "ports_list", "cve_count",
+                        "snmp_name", "snmp_uptime", "vlan", "http_sec_score",
+                        "tls_weakness_count"])
+            for h in RESULTS.get("hosts", []):
+                ports = h.get("ports", [])
+                cve_count = 0; http_score = None; tls_weak = 0
+                for p in ports:
+                    for pr in p.get("products", []):
+                        cve_count += len(pr.get("cves", []))
+                    if p.get("extra", {}).get("http_sec"):
+                        hs = p["extra"]["http_sec"].get("score")
+                        if hs is not None: http_score = hs
+                    if p.get("extra", {}).get("tls_weak"):
+                        tls_weak += len(p["extra"]["tls_weak"].get("weak", []))
+                snmp = h.get("snmp", {}) or {}
+                w.writerow([
+                    h.get("ip", ""), h.get("mac", ""), h.get("vendor", "") or "",
+                    h.get("rdns", "") or h.get("netbios", "") or "",
+                    h.get("os_passive", {}).get("os", "") if h.get("os_passive") else "",
+                    len(ports),
+                    ",".join(str(p["port"]) for p in ports),
+                    cve_count,
+                    snmp.get("sysName", ""),
+                    snmp.get("sysUpTime", ""),
+                    (h.get("lldp") or {}).get("vlan_pvid", "") if h.get("lldp") else "",
+                    http_score if http_score is not None else "",
+                    tls_weak,
+                ])
+        return path
+    except Exception as e:
+        print("CSV write failed: {}".format(e), file=sys.stderr)
+        return None
+
+
+# ============================================================
+# report helpers
+# ============================================================
+
 def print_host_ports(ip, ports):
     if not ports:
-        print("  {}: (no ports open)".format(ip))
-        return
+        print("  {}: (no ports open)".format(ip)); return
     print("  {}:".format(ip))
     for p in ports:
         print("    {:<6} {:<10} {}".format(p["port"], p["service"],
@@ -1945,33 +1962,38 @@ def print_host_ports(ip, ports):
         for pr in p.get("products", []):
             print("           -> {} {}".format(pr["product"], pr["version"]))
             for cve in pr.get("cves", [])[:5]:
-                print("              [{}] {} {}".format(
-                    cve.get("cvss", "?"), cve["id"], cve["desc"][:90]))
+                print("              [{}] {} {}".format(cve.get("cvss", "?"), cve["id"], cve["desc"][:90]))
         ex = p.get("extra", {})
-        if "tls" in ex:
-            print("           [tls] {} {}".format(ex["tls"].get("tls_version"),
-                                                   ex["tls"].get("cipher")))
         if "smb" in ex:
             s = ex["smb"]
-            print("           [smb] {} {}".format(
-                s.get("version"), s.get("server_os") or ""))
+            print("           [smb] {} {}".format(s.get("version"), s.get("server_os") or ""))
+        if "tls_weak" in ex and ex["tls_weak"]:
+            t = ex["tls_weak"]
+            protos = [k for k, v in t.get("protocols", {}).items() if v]
+            print("           [tls] supports: {}".format(", ".join(protos)))
+            print("           [tls] score: {}/100".format(t.get("score", 0)))
+            for w in t.get("weak", []):
+                print("           [tls] WEAK: {}".format(w))
+        if "http_sec" in ex and ex["http_sec"]:
+            hs = ex["http_sec"]
+            print("           [http-sec] score: {}/100".format(hs.get("score", 0)))
+            for m in hs.get("missing", []):
+                print("           [http-sec] MISSING: {}".format(m))
 
 
 def _print_passive(passive):
-    if not passive:
-        print("  (nothing captured)")
-        return
-    if passive.get("lldp") or passive.get("cdp"):
-        print("\n  [switch neighbor]")
-        if passive.get("lldp"):
-            print("    LLDP:")
-            for k, v in passive["lldp"].items():
-                print("      {:<18} : {}".format(k, v))
-        if passive.get("cdp"):
-            print("    CDP:")
-            for k, v in passive["cdp"].items():
-                print("      {:<18} : {}".format(k, v))
-        _result_set("lldp_cdp", {"lldp": passive["lldp"], "cdp": passive["cdp"]})
+    if not passive: print("  (nothing captured)"); return
+
+    if passive.get("lldp"):
+        print("\n  [LLDP switch neighbor]")
+        for k, v in passive["lldp"].items():
+            print("    {:<18} : {}".format(k, v))
+        _result_set("lldp_cdp", {"lldp": passive["lldp"], "cdp": passive.get("cdp")})
+    elif passive.get("cdp"):
+        print("\n  [CDP switch neighbor]")
+        for k, v in passive["cdp"].items():
+            print("    {:<18} : {}".format(k, v))
+        _result_set("lldp_cdp", {"lldp": None, "cdp": passive["cdp"]})
 
     if passive.get("arp_spoof"):
         print("\n  [!!! ARP SPOOF DETECTED ({}) !!!]".format(len(passive["arp_spoof"])))
@@ -1988,29 +2010,26 @@ def _print_passive(passive):
         _result_set("rogue_dhcp", True)
 
     if passive.get("dhcp_offers"):
-        print("\n  [DHCP offers ({})]".format(len(passive["dhcp_offers"])))
+        print("\n  [DHCP offers]")
         for o in passive["dhcp_offers"]:
-            print("    server={} your_ip={}".format(
-                o.get("server_ip"), o.get("your_ip")))
+            print("    server={} your_ip={}".format(o.get("server_ip"), o.get("your_ip")))
         _result_set("dhcp", {"offers": passive["dhcp_offers"]})
 
     if passive.get("arp"):
         print("\n  [ARP neighbors ({})]".format(len(passive["arp"])))
         for ip, mac in sorted(passive["arp"].items(),
                                key=lambda x: ipaddress.IPv4Address(x[0])):
-            vendor = oui_lookup(mac) or "?"
-            print("    {:<16} {:<18} {}".format(ip, mac, vendor))
+            print("    {:<16} {:<18} {}".format(ip, mac, oui_lookup(mac) or "?"))
 
     if passive.get("tcp_os"):
-        print("\n  [Passive OS fingerprint ({})]".format(len(passive["tcp_os"])))
+        print("\n  [Passive OS ({})]".format(len(passive["tcp_os"])))
         for ip, h in passive["tcp_os"].items():
-            print("    {:<16} {} (ttl={} win={})".format(
-                ip, h["os"], h["ttl"], h["window"]))
+            print("    {:<16} {} (ttl={} win={})".format(ip, h["os"], h["ttl"], h["window"]))
 
     if passive.get("tcp_uptime"):
-        print("\n  [TCP uptime (heuristic) ({})]".format(len(passive["tcp_uptime"])))
+        print("\n  [TCP uptime heuristic]")
         for ip, s in passive["tcp_uptime"].items():
-            print("    {:<16} up ~ {} (rough)".format(ip, format_uptime(s)))
+            print("    {:<16} up ~ {}".format(ip, format_uptime(s)))
 
     if passive.get("mdns"):
         print("\n  [mDNS ({})]".format(len(passive["mdns"])))
@@ -2019,62 +2038,74 @@ def _print_passive(passive):
         _result_set("mdns", passive["mdns"])
 
     if passive.get("ssdp"):
-        print("\n  [SSDP ({})]".format(len(passive["ssdp"])))
+        print("\n  [SSDP]")
         for s in passive["ssdp"][:20]:
             print("    {}  {}".format(s["ip"], s.get("server") or "-"))
         _result_set("ssdp", passive["ssdp"])
 
     if passive.get("tls_sni"):
-        print("\n  [TLS SNI ({})]".format(len(passive["tls_sni"])))
+        print("\n  [TLS SNI]")
         for s in passive["tls_sni"][:30]:
             print("    {}  ({})".format(s["sni"], s["dst"]))
 
     if passive.get("dns_queries"):
-        print("\n  [DNS queries ({})]".format(len(passive["dns_queries"])))
+        print("\n  [DNS queries]")
         seen = set()
         for q in passive["dns_queries"][:40]:
-            if q["host"] in seen:
-                continue
-            seen.add(q["host"])
-            print("    {}".format(q["host"]))
+            if q["host"] in seen: continue
+            seen.add(q["host"]); print("    {}".format(q["host"]))
 
     if passive.get("snmp_traps"):
-        print("\n  [SNMP traps ({})]".format(len(passive["snmp_traps"])))
+        print("\n  [SNMP traps]")
         for t in passive["snmp_traps"][:10]:
             print("    {} {}".format(t["src"], t["hex"][:60]))
         _result_set("snmp_traps", passive["snmp_traps"])
 
 
+def _extract_domain():
+    if _CRT_DOMAIN_OVERRIDE[0]: return _CRT_DOMAIN_OVERRIDE[0]
+    for line in _ipconfig_text().splitlines():
+        low = line.lower()
+        if "connection-specific dns suffix" in low or "sufiks dns" in low:
+            parts = line.split(":")
+            if len(parts) > 1:
+                d = parts[-1].strip().strip(",").strip(".")
+                if d: return d
+    for line in _ipconfig_text().splitlines():
+        low = line.lower()
+        if "dns suffix search list" in low:
+            parts = line.split(":")
+            if len(parts) > 1:
+                first = parts[-1].strip().split(",")[0].strip().strip(".")
+                if first: return first
+    return None
+
+
 def _run_external_lookups(net, do_crt, do_bgp):
-    gw = net.get("gateway")
-    if do_bgp and gw:
-        print("=== BGP / AS lookup for gateway {} ===".format(gw))
-        b = bgp_lookup(gw)
-        if b.get("asns"):
-            print("  prefix : {}".format(b.get("prefix")))
-            for a in b["asns"]:
-                print("  AS{}  {}".format(a["asn"], a["holder"]))
-            _result_set("bgp", b)
-        else:
-            print("  (no result)")
-        print()
+    if do_bgp:
+        target = _PUBLIC_IP_OVERRIDE[0] or get_public_ip() or net.get("gateway")
+        if target:
+            print("=== BGP / AS lookup for {} ===".format(target))
+            b = bgp_lookup(target)
+            if b.get("asns"):
+                print("  prefix : {}".format(b.get("prefix")))
+                for a in b["asns"]: print("  AS{}  {}".format(a["asn"], a["holder"]))
+                _result_set("bgp", b)
+            else: print("  (no result)")
+            _result_set("public_ip", target)
+            print()
 
     if do_crt:
-        domain = None
-        m = re.search(r"(?:DNS Suffix|Suffix)\s*[.:]+\s*(\S+)", _ipconfig_text())
-        if m:
-            domain = m.group(1).strip(".")
+        domain = _extract_domain()
         if domain and domain not in ("local", ""):
             print("=== crt.sh subdomains for {} ===".format(domain))
+            _result_set("domain", domain)
             subs = crt_sh_lookup(domain)
             if subs:
-                for s in subs[:60]:
-                    print("  {}".format(s))
-                if len(subs) > 60:
-                    print("  ... and {} more".format(len(subs) - 60))
+                for s in subs[:60]: print("  {}".format(s))
+                if len(subs) > 60: print("  ... and {} more".format(len(subs) - 60))
                 _result_set("crt_sh", subs)
-            else:
-                print("  (no results)")
+            else: print("  (no results)")
             print()
 
 
@@ -2087,8 +2118,7 @@ def recon(iface_override=None, subnet_override=None,
           do_nvd=True, do_crt=True, do_bgp=True, do_snmp_traps=True,
           max_hosts=512):
 
-    if delay_ms is None:
-        delay_ms = MODE_DELAY_MS.get(mode, 0)
+    if delay_ms is None: delay_ms = MODE_DELAY_MS.get(mode, 0)
     print("=== MODE: {} (delay {}ms) ===".format(mode.upper(), delay_ms))
     print()
     _result_set("timestamp", now_local_iso())
@@ -2098,12 +2128,10 @@ def recon(iface_override=None, subnet_override=None,
         iface = iface_override; reason = "manual --iface"
     else:
         iface, reason = pick_card(verbose=True)
-    if not iface:
-        sys.exit("cannot pick a card: {}".format(reason))
+    if not iface: sys.exit("cannot pick a card: {}".format(reason))
 
     net = get_my_network(iface)
-    if subnet_override:
-        net["subnet"] = subnet_override
+    if subnet_override: net["subnet"] = subnet_override
     desc = get_iface_desc(iface)
     wireless = is_wireless(desc)
 
@@ -2115,8 +2143,7 @@ def recon(iface_override=None, subnet_override=None,
     print("  my ip     : {}".format(net["ip"] or "-"))
     print("  subnet    : {}".format(net["subnet"] or "-"))
     print("  gateway   : {}".format(net["gateway"] or "-"))
-    if net.get("dns"):
-        print("  dns       : {}".format(", ".join(net["dns"])))
+    if net.get("dns"): print("  dns       : {}".format(", ".join(net["dns"])))
     print()
     _result_set("network", net)
 
@@ -2124,8 +2151,7 @@ def recon(iface_override=None, subnet_override=None,
         li = link_info(net["ip"]) if net["ip"] else None
         if li:
             print("=== LINK ===")
-            for k, v in li.items():
-                print("  {:<10} : {}".format(k, v))
+            for k, v in li.items(): print("  {:<10} : {}".format(k, v))
             print()
             _result_set("link", li)
 
@@ -2134,8 +2160,7 @@ def recon(iface_override=None, subnet_override=None,
         if w:
             _result_set("wifi", {"connected": w, "networks_in_range": []})
             print("=== WIFI ===")
-            for k, v in w.items():
-                print("  {:<10} : {}".format(k, v))
+            for k, v in w.items(): print("  {:<10} : {}".format(k, v))
             print()
 
     human_pause()
@@ -2157,14 +2182,11 @@ def recon(iface_override=None, subnet_override=None,
     human_pause()
     print()
     print("=== ARP SWEEP ({}) ===".format(net["subnet"]))
-    print("sweeping... ({}ms extra, max {} hosts)".format(delay_ms, max_hosts),
-          file=sys.stderr)
-    hosts = arp_sweep(net["subnet"], iface, delay_ms=delay_ms,
-                      max_hosts=max_hosts)
+    hosts = arp_sweep(net["subnet"], iface, delay_ms=delay_ms, max_hosts=max_hosts)
     hosts.sort(key=lambda h: ipaddress.IPv4Address(h["ip"]))
     print("found {} hosts".format(len(hosts)))
 
-    print("resolving names (throttled)...", file=sys.stderr)
+    print("resolving names...", file=sys.stderr)
     rdns_map = reverse_dns_batch([h["ip"] for h in hosts], workers=4)
     for h in hosts:
         h["rdns"] = rdns_map.get(h["ip"])
@@ -2172,31 +2194,33 @@ def recon(iface_override=None, subnet_override=None,
         h["vendor"] = oui_lookup(h["mac"])
         if passive and passive.get("tcp_os", {}).get(h["ip"]):
             h["os_passive"] = passive["tcp_os"][h["ip"]]
+        if passive and passive.get("lldp"):
+            h["lldp"] = passive["lldp"]
 
     for h in hosts:
         label = h["rdns"] or h["netbios"] or "?"
         vendor = h.get("vendor") or "?"
         os_hint = ""
-        if h.get("os_passive"):
-            os_hint = " [{}]".format(h["os_passive"]["os"])
+        if h.get("os_passive"): os_hint = " [{}]".format(h["os_passive"]["os"])
         marker = ""
-        if h["ip"] == net.get("gateway"):
-            marker = "  <- gateway"
-        elif h["ip"] == net.get("ip"):
-            marker = "  <- you"
+        if h["ip"] == net.get("gateway"): marker = "  <- gateway"
+        elif h["ip"] == net.get("ip"): marker = "  <- you"
         print("  {:<16} {:<18} {:<20} {:<16}{}{}".format(
             h["ip"], h["mac"], label[:20], vendor[:16], os_hint, marker))
     print()
 
     human_pause()
-    print("=== mDNS deep enum ===")
+    print("=== mDNS deep enum (SRV + TXT) ===")
     mdns_deep = mdns_deep_enum(iface, timeout=8)
     if mdns_deep:
         for m in mdns_deep[:30]:
-            print("  {}  {} -> {}".format(m["ip"], m["name"], m["data"]))
+            print("  {}  {}".format(m.get("ip"), m.get("name")))
+            if m.get("srv_target"):
+                print("    srv: {}:{}".format(m["srv_target"], m.get("srv_port")))
+            if m.get("txt"):
+                print("    txt: {}".format(", ".join(m["txt"][:5])))
         _result_set("mdns_deep", mdns_deep)
-    else:
-        print("  (no responses)")
+    else: print("  (no responses)")
     print()
 
     if HAVE_SNMP:
@@ -2208,17 +2232,20 @@ def recon(iface_override=None, subnet_override=None,
             for h in targets:
                 res = snmp_probe(h["ip"])
                 sleep_delay(delay_ms)
-                if not res:
-                    continue
+                if not res: continue
                 h["snmp"] = res
                 print("  {}:".format(h["ip"]))
                 for k, v in res.items():
                     print("    {:<12} : {}".format(k, v))
+                if res.get("sysUpTime"):
+                    up = snmp_uptime_human(res["sysUpTime"])
+                    if up:
+                        print("    {:<12} : {}".format("uptime", up["human"]))
+                        if up["warning"]: print("    WARNING: {}".format(up["warning"]))
                 if res.get("sysDescr") and do_nvd:
                     for prod, ver in detect_product_version(res["sysDescr"]):
                         for c in nvd_lookup(prod, ver)[:5]:
-                            print("    -> [{}] {} {}".format(
-                                c.get("cvss", "?"), c["id"], c["desc"][:90]))
+                            print("    -> [{}] {} {}".format(c.get("cvss", "?"), c["id"], c["desc"][:90]))
                 if mode == "aggressive":
                     ifs = snmp_walk_interfaces(h["ip"])
                     if ifs:
@@ -2231,8 +2258,7 @@ def recon(iface_override=None, subnet_override=None,
                     if arp_tab:
                         h["snmp_arp"] = arp_tab
                         print("    [arp table]")
-                        for e in arp_tab[:30]:
-                            print("      {}  {}".format(e["ip"], e["mac"]))
+                        for e in arp_tab[:30]: print("      {}  {}".format(e["ip"], e["mac"]))
             print()
 
     gw = net.get("gateway")
@@ -2241,53 +2267,91 @@ def recon(iface_override=None, subnet_override=None,
         print("=== UPnP IGD ({}) ===".format(gw))
         igd = upnp_igd_query(gw)
         _result_set("upnp_igd", igd)
-        if igd.get("external_ip"):
-            print("  external IP : {}".format(igd["external_ip"]))
-        if igd.get("control_url"):
-            print("  control url : {}".format(igd["control_url"]))
+        if igd.get("external_ip"): print("  external IP : {}".format(igd["external_ip"]))
+        if igd.get("control_url"): print("  control url : {}".format(igd["control_url"]))
         if not igd.get("external_ip") and not igd.get("control_url"):
             print("  (no IGD response)")
         print()
 
+    # NTP
+    if mode == "aggressive":
+        human_pause()
+        print("=== NTP enumeration ===")
+        for h in hosts:
+            r = ntp_query(h["ip"], timeout=1)
+            sleep_delay(delay_ms)
+            if r:
+                print("  {}: stratum={} ref={} skew={}s".format(
+                    h["ip"], r["stratum"], r["ref_id_ascii"], r.get("clock_skew_s", "?")))
+                h["ntp"] = r
+        print()
+
     if net.get("dns"):
-        domain = None
-        m = re.search(r"(?:DNS Suffix|Suffix)\s*[.:]+\s*(\S+)", _ipconfig_text())
-        if m:
-            domain = m.group(1).strip(".")
+        domain = _extract_domain()
         if domain and domain not in ("local", ""):
             human_pause()
             print("=== DNS SRV enum ({}) ===".format(domain))
             srv = dns_srv_enum(domain, dns_server=net["dns"][0] if net["dns"] else None)
-            for s in srv:
-                print("  {} -> {}:{}".format(s["srv"], s["target"], s["port"]))
+            for s in srv: print("  {} -> {}:{}".format(s["srv"], s["target"], s["port"]))
             _result_set("dns_srv", srv)
             print()
 
+            # wildcard check
+            print("=== DNS wildcard check ({}) ===".format(domain))
+            wc = dns_wildcard_check(domain, dns_server=net["dns"][0] if net["dns"] else None)
+            if wc:
+                _result_set("dns_wildcard", wc)
+                if wc.get("wildcard"):
+                    print("  WILDCARD ACTIVE — random subdomain resolves to {}".format(
+                        ", ".join(wc.get("resolves_to", []))))
+                    print("  (reverse DNS in this domain is unreliable)")
+                else:
+                    print("  no wildcard (reverse DNS is reliable)")
+            print()
+
+            # Kerberos + LDAP (only aggressive)
             if mode == "aggressive":
-                print("=== DNS zone transfer attempt ({}) over TCP ===".format(domain))
+                print("=== Kerberos realm ===")
+                realm = kerberos_realm(domain, net["dns"][0] if net["dns"] else None)
+                if realm:
+                    print("  realm: {}".format(realm))
+                    _result_set("kerberos_realm", realm)
+                else: print("  (none)")
+                print()
+
+                print("=== LDAP anonymous bind ===")
+                for h in hosts:
+                    if not any(p["port"] in (389, 636) for p in h.get("ports", [])):
+                        continue
+                    ok = ldap_anon_bind(h["ip"], 389)
+                    print("  {}:389 anonymous bind -> {}".format(h["ip"], "ALLOWED" if ok else "denied"))
+                    h["ldap_anon"] = {"allowed": ok}
+                    _result_set("ldap_anon", h["ldap_anon"])
+                print()
+
+            if mode == "aggressive":
+                print("=== DNS zone transfer (AXFR) ===")
                 zr = dns_zone_transfer(domain, net["dns"][0])
                 if zr.get("success"):
-                    print("  SUCCESS! {} records".format(len(zr["records"])))
+                    print("  SUCCESS! {} messages, SOA={}".format(
+                        len(zr["records"]), zr["soa_count"]))
                     _result_set("dns_axfr", zr)
                 else:
-                    print("  rejected (expected) — {}".format(
-                        zr.get("error", "no data")))
+                    print("  rejected (expected) — {}".format(zr.get("error", "no data")))
                 print()
 
     human_pause()
     port_map = TOP_PORTS_20 if mode == "normal" else TOP_PORTS_50
     workers = 1 if mode == "normal" else 2
-    print("=== TCP PORT SCAN ({} ports, {} thread(s)) + CVE ===".format(
-        len(port_map), workers))
+    print("=== TCP PORT SCAN ({} ports) + CVE + TLS + HTTP audit ===".format(len(port_map)))
+    audit = mode == "aggressive"
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        fs = {ex.submit(scan_host, h["ip"], port_map, do_nvd, delay_ms): h
+        fs = {ex.submit(scan_host, h["ip"], port_map, do_nvd, delay_ms, audit, audit): h
               for h in hosts}
         for fut in concurrent.futures.as_completed(fs):
             h = fs[fut]
-            try:
-                ports = fut.result()
-            except Exception:
-                ports = []
+            try: ports = fut.result()
+            except Exception: ports = []
             h["ports"] = ports
             print_host_ports(h["ip"], ports)
     print()
@@ -2317,15 +2381,14 @@ def recon(iface_override=None, subnet_override=None,
     human_pause()
     print("=== Printer enum ===")
     for h in hosts:
-        if not h.get("ports"):
-            continue
+        if not h.get("ports"): continue
+        if not any(p["port"] in PRINTER_PORTS for p in h["ports"]): continue
         r = printer_enum(h["ip"])
         sleep_delay(delay_ms)
         if r:
             print("  {}:".format(h["ip"]))
             for k, v in r.items():
-                if v:
-                    print("    [{}] {}".format(k, v[:100]))
+                if v: print("    [{}] {}".format(k, v[:100]))
             h["printer"] = r
     print()
 
@@ -2334,8 +2397,7 @@ def recon(iface_override=None, subnet_override=None,
         print("=== HTTP enum ===")
         for h in hosts:
             for p in h.get("ports", []):
-                if p["service"] not in ("http", "http-alt"):
-                    continue
+                if p["service"] not in ("http", "http-alt"): continue
                 r = http_enum(h["ip"], p["port"])
                 sleep_delay(delay_ms)
                 if r:
@@ -2348,52 +2410,52 @@ def recon(iface_override=None, subnet_override=None,
                             print("      {}".format(line))
             print()
 
-    with RESULTS_LOCK:
-        RESULTS["hosts"] = hosts
+    with RESULTS_LOCK: RESULTS["hosts"] = hosts
 
     _run_external_lookups(net, do_crt, do_bgp)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Full LAN recon suite (stealth)")
+    ap = argparse.ArgumentParser(description="Full LAN recon suite")
     ap.add_argument("--iface")
     ap.add_argument("--subnet")
-    ap.add_argument("--mode", choices=["stealth", "normal", "aggressive"],
-                    default="stealth")
+    ap.add_argument("--mode", choices=["stealth", "normal", "aggressive"], default="stealth")
     ap.add_argument("--delay", type=int, default=None)
     ap.add_argument("--sniff", type=int, default=90)
     ap.add_argument("--max-hosts", type=int, default=512)
-    ap.add_argument("--no-nvd", action="store_true")
+    ap.add_argument("--no-nvd", "--no-cve", action="store_true", dest="no_nvd")
     ap.add_argument("--no-crt", action="store_true")
     ap.add_argument("--no-bgp", action="store_true")
+    ap.add_argument("--public-ip", help="override public IP for BGP")
+    ap.add_argument("--crt-domain", help="override domain for crt.sh")
+    ap.add_argument("--aggressive-timing", action="store_true")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--csv", action="store_true", help="export hosts to CSV")
+    ap.add_argument("--diff", metavar="OLD.json",
+                    help="compare with previous run (writes diff to stdout)")
     args = ap.parse_args()
-    if not HAVE_SCAPY:
-        sys.exit("scapy not installed: pip install scapy")
-    if not HAVE_SNMP:
-        print("warning: pysnmp missing, SNMP skipped", file=sys.stderr)
-    if not HAVE_REQUESTS:
-        print("warning: requests missing, NVD/crt.sh/BGP skipped", file=sys.stderr)
+
+    if args.aggressive_timing: _AGGRESSIVE_TIMING[0] = True
+    if args.public_ip: _PUBLIC_IP_OVERRIDE[0] = args.public_ip
+    if args.crt_domain: _CRT_DOMAIN_OVERRIDE[0] = args.crt_domain
+
+    if not HAVE_SCAPY: sys.exit("scapy not installed: pip install scapy")
+    if not HAVE_SNMP: print("warning: pysnmp missing, SNMP skipped", file=sys.stderr)
+    if not HAVE_REQUESTS: print("warning: requests missing, NVD/crt.sh/BGP skipped", file=sys.stderr)
 
     log_path = _start_logging()
-    if log_path:
-        print("logging to: {}".format(log_path))
+    if log_path: print("logging to: {}".format(log_path))
 
     try:
-        recon(
-            iface_override=args.iface, subnet_override=args.subnet,
-            mode=args.mode, delay_ms=args.delay,
-            sniff_seconds=args.sniff,
-            do_nvd=not args.no_nvd,
-            do_crt=not args.no_crt,
-            do_bgp=not args.no_bgp,
-            max_hosts=args.max_hosts,
-        )
+        recon(iface_override=args.iface, subnet_override=args.subnet,
+              mode=args.mode, delay_ms=args.delay, sniff_seconds=args.sniff,
+              do_nvd=not args.no_nvd, do_crt=not args.no_crt,
+              do_bgp=not args.no_bgp, max_hosts=args.max_hosts)
     finally:
         print()
         print("=== DONE ===")
-        if log_path:
-            print("full log saved to: {}".format(log_path))
+        if log_path: print("full log saved to: {}".format(log_path))
+
         if args.json:
             os.makedirs(LOG_DIR, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2402,8 +2464,14 @@ def main():
                 with open(jp, "w", encoding="utf-8") as f:
                     json.dump(RESULTS, f, indent=2, ensure_ascii=False, default=str)
                 print("json saved to: {}".format(jp))
-            except Exception as e:
-                print("json save failed: {}".format(e))
+            except Exception as e: print("json save failed: {}".format(e))
+
+        if args.csv:
+            cp = export_csv()
+            if cp: print("csv saved to: {}".format(cp))
+
+        if args.diff:
+            diff_runs(args.diff)
 
 
 if __name__ == "__main__":
